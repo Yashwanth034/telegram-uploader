@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.12"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Compile Python entry points
+        run: python -m py_compile src/bulkuploader/app.py src/bulkuploader/tdlib_native.py install.py
+
+      - name: Smoke test self-contained installer (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python install.py
+          "$HOME/.local/bin/telegram" doctor
+
+      - name: Smoke test self-contained installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python install.py
+          & "$env:LOCALAPPDATA\telegram-uploader\bin\telegram.cmd" doctor

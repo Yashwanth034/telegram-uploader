@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-uploader"
+version = "0.2.0"
+description = "TG Uploader: a cross-platform terminal uploader and text messenger for Telegram, with TDLib acceleration, resume, and duplicate protection."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+keywords = ["telegram", "tdlib", "telethon", "uploader", "cli"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+  "blake3>=1.0.0",
+  "cryptg>=0.6.0,<1",
+  "platformdirs>=4.0.0",
+  "rich>=13.7.0",
+  "telethon>=1.36.0,<2",
+  "windows-curses>=2.4.2; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+telegram = "bulkuploader.app:telegram_entry"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
