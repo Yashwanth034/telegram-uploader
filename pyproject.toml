@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telegram-uploader"
-version = "0.2.0"
+version = "1.0.0"
 description = "TG Uploader: a cross-platform terminal uploader and text messenger for Telegram, with TDLib acceleration, resume, and duplicate protection."
 readme = "README.md"
 license = {file = "LICENSE"}

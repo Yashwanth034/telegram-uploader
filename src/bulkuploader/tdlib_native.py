@@ -20,7 +20,7 @@ from typing import Callable
 from platformdirs import user_data_dir
 
 APP_NAME = "telegram-uploader"
-APP_VERSION = "0.2.0"
+APP_VERSION = "1.0.0"
 DATA_DIR = Path(user_data_dir(APP_NAME, appauthor=False))
 TDLIB_ROOT = DATA_DIR / "tdlib"
 TDLIB_DB_DIR = DATA_DIR / "tdlib-native-db"
