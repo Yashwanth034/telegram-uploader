@@ -171,10 +171,10 @@ def main() -> int:
     source_package = (source_dir / "src" / "bulkuploader").resolve()
     root = app_data_root()
     runtime = root / "runtime"
-    venv = runtime / "venv"
+    venv_dir = runtime / "venv"
     bin_home = command_home(root)
 
-    for candidate, label in ((root, "application-data directory"), (runtime, "runtime directory"), (venv, "virtual environment")):
+    for candidate, label in ((root, "application-data directory"), (runtime, "runtime directory"), (venv_dir, "virtual environment")):
         if candidate.is_symlink():
             raise RuntimeError(f"Refusing to use symlinked {label}: {candidate}")
 
@@ -187,8 +187,8 @@ def main() -> int:
             pass
 
     print(f"Installing {PUBLIC_NAME} for {sys.platform}...")
-    venv.EnvBuilder(with_pip=True).create(venv)
-    python = venv_python(venv)
+    venv.EnvBuilder(with_pip=True).create(venv_dir)
+    python = venv_python(venv_dir)
     if not python.is_file():
         raise RuntimeError(f"Virtual-environment Python is missing or invalid: {python}")
 
@@ -213,7 +213,7 @@ def main() -> int:
     if installed_from.parent == source_package:
         raise RuntimeError("Install verification failed: telegram still points at the source package.")
 
-    path_changed = _install_launcher(venv, bin_home)
+    path_changed = _install_launcher(venv_dir, bin_home)
 
     print()
     print("Installed command: telegram")

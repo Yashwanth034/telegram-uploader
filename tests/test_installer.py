@@ -78,3 +78,36 @@ def test_posix_path_setup_refuses_symlinked_profile(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="symlinked shell profile"):
         installer._add_posix_user_path(target)
     assert real_profile.read_text(encoding="utf-8") == "safe\n"
+
+
+def test_installer_main_uses_venv_module_without_name_collision(tmp_path, monkeypatch):
+    installer = _load_installer()
+    root = tmp_path / "data"
+    created = []
+
+    class FakeBuilder:
+        def create(self, target):
+            created.append(target)
+            python = installer.venv_python(target)
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text("", encoding="utf-8")
+
+    def fake_run(args, **kwargs):
+        class Result:
+            stdout = ""
+
+        if "-c" in args:
+            installed = tmp_path / "installed" / "bulkuploader" / "__init__.py"
+            installed.parent.mkdir(parents=True, exist_ok=True)
+            installed.write_text("", encoding="utf-8")
+            Result.stdout = f"{installed}\n"
+        return Result()
+
+    monkeypatch.setattr(installer, "app_data_root", lambda: root)
+    monkeypatch.setattr(installer, "command_home", lambda _root: tmp_path / "bin")
+    monkeypatch.setattr(installer.venv, "EnvBuilder", lambda **_kwargs: FakeBuilder())
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setattr(installer, "_install_launcher", lambda venv_dir, bin_home: False)
+
+    assert installer.main() == 0
+    assert created == [root / "runtime" / "venv"]
