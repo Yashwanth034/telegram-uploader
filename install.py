@@ -13,6 +13,10 @@ PACKAGE_NAME = "telegram-uploader"
 PUBLIC_NAME = "TG Uploader"
 
 
+def _windows_launcher_content() -> str:
+    return '@echo off\r\n"%~dp0..\\runtime\\venv\\Scripts\\telegram.exe" %*\r\n'
+
+
 def _windows_known_folder(csidl: int) -> Path:
     if os.name != "nt":
         raise RuntimeError("Windows known-folder lookup is only available on Windows.")
@@ -98,8 +102,11 @@ def _add_windows_user_path(directory: Path) -> bool:
                 ctypes.byref(result),
             )
         return True
-    except Exception as exc:
-        print(f"Warning: could not add {directory} to your user PATH automatically: {exc}", file=sys.stderr)
+    except Exception:
+        # Do not echo profile-derived absolute paths or exception text. The
+        # installer can continue safely; the user only needs to know PATH was
+        # not updated automatically.
+        print("Warning: could not update your user PATH automatically.", file=sys.stderr)
         return False
 
 
@@ -127,7 +134,7 @@ def _add_posix_user_path(directory: Path) -> bool:
         return False
 
     if profile.is_symlink():
-        raise RuntimeError(f"Refusing to modify symlinked shell profile: {profile}")
+        raise RuntimeError("Refusing to modify a symlinked shell profile.")
 
     marker = "# telegram-uploader: user command path"
     export_line = 'export PATH="$HOME/.local/bin:$PATH"'
@@ -143,20 +150,18 @@ def _add_posix_user_path(directory: Path) -> bool:
 
 def _install_launcher(venv: Path, bin_home: Path) -> bool:
     if bin_home.is_symlink():
-        raise RuntimeError(f"Refusing to install into symlinked command directory: {bin_home}")
+        raise RuntimeError("Refusing to install into a symlinked command directory.")
     bin_home.mkdir(parents=True, exist_ok=True)
     target = venv_telegram(venv)
     if not target.is_file() or target.is_symlink():
-        raise RuntimeError(f"Installed telegram launcher target is not a trusted regular file: {target}")
+        raise RuntimeError("Installed telegram launcher target is not a trusted regular file.")
     if os.name == "nt":
         launcher = bin_home / "telegram.cmd"
         if launcher.is_symlink():
-            raise RuntimeError(f"Refusing to overwrite symlinked launcher: {launcher}")
-        launcher.write_text(
-            "@echo off\r\n"
-            f'"{target}" %*\r\n',
-            encoding="utf-8",
-        )
+            raise RuntimeError("Refusing to overwrite a symlinked launcher.")
+        # Keep the launcher relocatable and avoid persisting a profile-derived
+        # absolute path in clear text. bin/ is a sibling of runtime/.
+        launcher.write_text(_windows_launcher_content(), encoding="utf-8")
         return _add_windows_user_path(bin_home)
 
     launcher = bin_home / "telegram"
@@ -176,7 +181,7 @@ def main() -> int:
 
     for candidate, label in ((root, "application-data directory"), (runtime, "runtime directory"), (venv_dir, "virtual environment")):
         if candidate.is_symlink():
-            raise RuntimeError(f"Refusing to use symlinked {label}: {candidate}")
+            raise RuntimeError(f"Refusing to use a symlinked {label}.")
 
     root.mkdir(parents=True, exist_ok=True)
     runtime.mkdir(parents=True, exist_ok=True)
@@ -190,7 +195,7 @@ def main() -> int:
     venv.EnvBuilder(with_pip=True).create(venv_dir)
     python = venv_python(venv_dir)
     if not python.is_file():
-        raise RuntimeError(f"Virtual-environment Python is missing or invalid: {python}")
+        raise RuntimeError("Virtual-environment Python is missing or invalid.")
 
     # Use argv lists with shell=False and an installer-created Python executable.
     # Upgrade pip first so fresh environments don't retain vulnerable ensurepip builds.
@@ -217,13 +222,13 @@ def main() -> int:
 
     print()
     print("Installed command: telegram")
-    print(f"Installed package: {installed_from}")
-    print(f"Application data: {root}")
+    print("Installed package verified.")
+    print("Application data directory prepared.")
     print("The source/repository folder is no longer required for daily use.")
     if path_changed:
         print("Open a new terminal once so the updated user PATH is visible.")
     elif str(bin_home) not in os.environ.get("PATH", "").split(os.pathsep):
-        print(f"Add {bin_home} to PATH if your shell does not already include it.")
+        print("Add the TG Uploader user command directory to PATH if your shell does not already include it.")
     return 0
 
 

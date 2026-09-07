@@ -80,7 +80,15 @@ def test_posix_path_setup_refuses_symlinked_profile(tmp_path, monkeypatch):
     assert real_profile.read_text(encoding="utf-8") == "safe\n"
 
 
-def test_installer_main_uses_venv_module_without_name_collision(tmp_path, monkeypatch):
+def test_windows_launcher_content_uses_relative_runtime_path():
+    installer = _load_installer()
+    content = installer._windows_launcher_content()
+    assert "%~dp0" in content
+    assert "runtime\\venv\\Scripts\\telegram.exe" in content
+    assert ":\\" not in content
+
+
+def test_installer_main_uses_venv_module_without_name_collision(tmp_path, monkeypatch, capsys):
     installer = _load_installer()
     root = tmp_path / "data"
     created = []
@@ -111,3 +119,6 @@ def test_installer_main_uses_venv_module_without_name_collision(tmp_path, monkey
 
     assert installer.main() == 0
     assert created == [root / "runtime" / "venv"]
+    captured = capsys.readouterr()
+    assert str(tmp_path) not in captured.out
+    assert str(tmp_path) not in captured.err
