@@ -41,6 +41,19 @@ def test_scan_hashes_identical_content_same_digest(tmp_path: Path):
     assert content[0].digest == content[1].digest
 
 
+def test_scan_does_not_follow_direct_symbolic_link(tmp_path: Path):
+    db = StateDB(tmp_path / "state.sqlite3")
+    target = tmp_path / "private.txt"
+    link = tmp_path / "selected-link"
+    target.write_bytes(b"private")
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are unavailable on this host")
+
+    assert scan_paths([link], db) == []
+
+
 def test_destination_specific_duplicate_history(tmp_path: Path):
     db = StateDB(tmp_path / "state.sqlite3")
     f = tmp_path / "video.mp4"

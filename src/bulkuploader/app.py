@@ -342,11 +342,16 @@ def scan_paths(inputs: Iterable[Path], db: StateDB) -> list[FileRecord]:
     seen_paths: set[Path] = set()
     files: list[Path] = []
     for raw in inputs:
-        p = raw.expanduser().resolve()
+        p = raw.expanduser()
+        # Check the user-supplied path before resolving it. resolve() follows
+        # symlinks, which would otherwise turn a symlink into its target and defeat
+        # the safety rule below, potentially uploading an unintended target file.
+        if p.is_symlink():
+            console.print(f"[dim]Skipping symbolic link:[/] {p}")
+            continue
+        p = p.resolve()
         if not p.exists():
             console.print(f"[yellow]Skipping missing path:[/] {p}")
-            continue
-        if p.is_symlink():
             continue
         if p.is_file():
             if _is_transient_file(p):
