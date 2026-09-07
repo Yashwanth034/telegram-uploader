@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -124,6 +125,44 @@ def test_telegram_direct_is_browserless_by_design():
     tg = TelegramDirect()
     assert not hasattr(tg, "page")
     assert not hasattr(tg, "context")
+
+
+def test_api_hash_is_saved_only_to_secure_store(tmp_path, monkeypatch):
+    import bulkuploader.app as app
+    import bulkuploader.secure_store as secure_store
+
+    config = tmp_path / "telegram-api.json"
+    monkeypatch.setattr(app, "TELEGRAM_CONFIG_PATH", config)
+    captured = {}
+
+    def save_secret(name, value):
+        captured[name] = value
+        return True
+
+    monkeypatch.setattr(secure_store, "set_secret", save_secret)
+    assert app._save_telegram_api_config(12345, "super-secret-api-hash") is True
+    assert json.loads(config.read_text(encoding="utf-8")) == {"api_id": 12345}
+    assert "super-secret-api-hash" not in config.read_text(encoding="utf-8")
+    assert captured["telegram-api-hash:12345"] == "super-secret-api-hash"
+
+
+def test_legacy_plaintext_api_hash_is_removed_during_migration(tmp_path, monkeypatch):
+    import bulkuploader.app as app
+    import bulkuploader.secure_store as secure_store
+
+    config = tmp_path / "telegram-api.json"
+    config.write_text(
+        json.dumps({"api_id": 67890, "api_hash": "legacy-secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app, "TELEGRAM_CONFIG_PATH", config)
+    stored = {}
+    monkeypatch.setattr(secure_store, "set_secret", lambda name, value: stored.setdefault(name, value) is not None)
+    monkeypatch.setattr(secure_store, "get_secret", lambda name: None)
+
+    assert app._load_telegram_api_config() == (67890, "legacy-secret")
+    assert json.loads(config.read_text(encoding="utf-8")) == {"api_id": 67890}
+    assert stored["telegram-api-hash:67890"] == "legacy-secret"
 
 
 def test_login_reuses_phone_for_optional_tdlib_session(monkeypatch):
@@ -648,19 +687,21 @@ def test_tdlib_runtime_status_detects_local_runtime(tmp_path: Path, monkeypatch)
     assert str(status["sqlcipher"]).endswith("libsqlcipher.so.1.1.0")
 
 
-def test_tdlib_external_library_does_not_require_bundled_sqlcipher(tmp_path: Path, monkeypatch):
+def test_tdlib_ignores_environment_library_override(tmp_path: Path, monkeypatch):
     import bulkuploader.tdlib_native as tdlib
 
-    library = tmp_path / "tdjson.dll"
+    library = tmp_path / "attacker-controlled" / "tdjson.dll"
+    library.parent.mkdir()
     library.write_bytes(b"x")
     monkeypatch.setenv("TDLIB_LIBRARY", str(library))
     monkeypatch.setattr(tdlib, "_platform_name", lambda: "windows")
     monkeypatch.setattr(tdlib, "_machine_name", lambda: "amd64")
+    monkeypatch.setattr(tdlib.shutil, "which", lambda name: None)
+
     status = tdlib.tdlib_runtime_status(tmp_path / "local-runtime")
     assert status["supported"] is True
-    assert status["installed"] is True
-    assert status["library"] == str(library)
-    assert status["sqlcipher"] is None
+    assert status["installed"] is False
+    assert status["library"] is None
     assert "vcpkg" in str(status["setup_hint"]).lower()
 
 

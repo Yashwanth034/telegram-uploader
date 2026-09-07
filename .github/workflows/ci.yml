@@ -40,8 +40,8 @@ jobs:
       - name: Run tests
         run: python -m pytest
 
-      - name: Compile Python entry points
-        run: python -m py_compile src/bulkuploader/app.py src/bulkuploader/tdlib_native.py install.py
+      - name: Compile Python sources
+        run: python -m py_compile src/bulkuploader/app.py src/bulkuploader/tdlib_native.py src/bulkuploader/secure_store.py src/bulkuploader/paths.py install.py
 
       - name: Smoke test self-contained installer (Linux/macOS)
         if: runner.os != 'Windows'
@@ -56,3 +56,27 @@ jobs:
         run: |
           python install.py
           & "$env:LOCALAPPDATA\telegram-uploader\bin\telegram.cmd" doctor
+
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project and security tools
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pip install "bandit>=1.8,<2" "pip-audit>=2.9,<3"
+
+      - name: Scan Python source for medium/high security findings
+        run: python -m bandit -q -r src install.py -ll -ii
+
+      - name: Audit installed dependencies
+        run: python -m pip_audit

@@ -22,7 +22,7 @@ dependencies = [
   "blake3>=1.0.0",
   "cryptg>=0.5.2,<0.6; python_version < '3.11'",
   "cryptg>=0.6.0,<1; python_version >= '3.11'",
-  "platformdirs>=4.0.0",
+  "keyring>=25.0.0,<26",
   "rich>=13.7.0",
   "telethon>=1.36.0,<2",
   "windows-curses>=2.4.2; platform_system == 'Windows'",

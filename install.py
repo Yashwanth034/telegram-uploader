@@ -5,6 +5,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 APP_DATA_NAME = "telegram-uploader"
@@ -12,17 +13,35 @@ PACKAGE_NAME = "telegram-uploader"
 PUBLIC_NAME = "TG Uploader"
 
 
-def app_data_root(platform_name: str | None = None, home: Path | None = None) -> Path:
-    platform_name = sys.platform if platform_name is None else platform_name
-    home = Path.home() if home is None else Path(home)
-    if platform_name == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or (home / "AppData" / "Local"))
-    elif platform_name == "darwin":
-        base = home / "Library" / "Application Support"
+def _windows_known_folder(csidl: int) -> Path:
+    if os.name != "nt":
+        raise RuntimeError("Windows known-folder lookup is only available on Windows.")
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buffer)
+    if result != 0 or not buffer.value:
+        raise RuntimeError(f"Windows known-folder lookup failed (CSIDL {csidl}, error {result}).")
+    return Path(buffer.value).resolve()
+
+
+def _trusted_home() -> Path:
+    if os.name == "nt":
+        return _windows_known_folder(0x0028)  # CSIDL_PROFILE
+    import pwd
+
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+
+
+def app_data_root() -> Path:
+    if sys.platform == "win32":
+        base = _windows_known_folder(0x001C)  # CSIDL_LOCAL_APPDATA
     else:
-        base = Path(os.environ.get("XDG_DATA_HOME") or (home / ".local" / "share"))
-    # Keep the historical application-data directory stable across the public
-    # branding/package rename so existing sessions and upload history keep working.
+        safe_home = _trusted_home()
+        if sys.platform == "darwin":
+            base = safe_home / "Library" / "Application Support"
+        else:
+            # Deliberately ignore HOME/XDG_DATA_HOME environment overrides in the
+            # installer. Local environment poisoning must not redirect writes.
+            base = safe_home / ".local" / "share"
     return base / APP_DATA_NAME
 
 
@@ -37,11 +56,7 @@ def venv_telegram(venv: Path) -> Path:
 def command_home(root: Path) -> Path:
     if os.name == "nt":
         return root / "bin"
-    return Path.home() / ".local" / "bin"
-
-
-def _run(args: list[str | os.PathLike[str]]) -> None:
-    subprocess.run([str(x) for x in args], check=True)
+    return _trusted_home() / ".local" / "bin"
 
 
 def _add_windows_user_path(directory: Path) -> bool:
@@ -88,18 +103,20 @@ def _add_windows_user_path(directory: Path) -> bool:
         return False
 
 
-def _add_posix_user_path(
-    directory: Path,
-    *,
-    host_os_name: str | None = None,
-    home: Path | None = None,
-) -> bool:
-    host_os_name = os.name if host_os_name is None else host_os_name
-    if host_os_name == "nt" or str(directory) in os.environ.get("PATH", "").split(os.pathsep):
+def _trusted_shell_name() -> str:
+    if os.name == "nt":
+        return ""
+    import pwd
+
+    return Path(pwd.getpwuid(os.getuid()).pw_shell or "").name
+
+
+def _add_posix_user_path(directory: Path) -> bool:
+    if os.name == "nt" or str(directory) in os.environ.get("PATH", "").split(os.pathsep):
         return False
 
-    shell = Path(os.environ.get("SHELL", "")).name
-    home = Path.home() if home is None else Path(home)
+    shell = _trusted_shell_name()
+    home = _trusted_home()
     if shell == "zsh":
         profile = home / ".zshrc"
     elif shell == "bash":
@@ -108,6 +125,9 @@ def _add_posix_user_path(
         profile = home / ".profile"
     else:
         return False
+
+    if profile.is_symlink():
+        raise RuntimeError(f"Refusing to modify symlinked shell profile: {profile}")
 
     marker = "# telegram-uploader: user command path"
     export_line = 'export PATH="$HOME/.local/bin:$PATH"'
@@ -122,10 +142,16 @@ def _add_posix_user_path(
 
 
 def _install_launcher(venv: Path, bin_home: Path) -> bool:
+    if bin_home.is_symlink():
+        raise RuntimeError(f"Refusing to install into symlinked command directory: {bin_home}")
     bin_home.mkdir(parents=True, exist_ok=True)
     target = venv_telegram(venv)
+    if not target.is_file() or target.is_symlink():
+        raise RuntimeError(f"Installed telegram launcher target is not a trusted regular file: {target}")
     if os.name == "nt":
         launcher = bin_home / "telegram.cmd"
+        if launcher.is_symlink():
+            raise RuntimeError(f"Refusing to overwrite symlinked launcher: {launcher}")
         launcher.write_text(
             "@echo off\r\n"
             f'"{target}" %*\r\n',
@@ -148,6 +174,10 @@ def main() -> int:
     venv = runtime / "venv"
     bin_home = command_home(root)
 
+    for candidate, label in ((root, "application-data directory"), (runtime, "runtime directory"), (venv, "virtual environment")):
+        if candidate.is_symlink():
+            raise RuntimeError(f"Refusing to use symlinked {label}: {candidate}")
+
     root.mkdir(parents=True, exist_ok=True)
     runtime.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -157,10 +187,16 @@ def main() -> int:
             pass
 
     print(f"Installing {PUBLIC_NAME} for {sys.platform}...")
-    _run([sys.executable, "-m", "venv", venv])
+    venv.EnvBuilder(with_pip=True).create(venv)
     python = venv_python(venv)
-    _run([python, "-m", "pip", "uninstall", "-y", PACKAGE_NAME])
-    _run([python, "-m", "pip", "install", source_dir])
+    if not python.is_file():
+        raise RuntimeError(f"Virtual-environment Python is missing or invalid: {python}")
+
+    # Use argv lists with shell=False and an installer-created Python executable.
+    # Upgrade pip first so fresh environments don't retain vulnerable ensurepip builds.
+    subprocess.run([str(python), "-m", "pip", "install", "--upgrade", "pip>=26.2.1,<27"], check=True, shell=False)
+    subprocess.run([str(python), "-m", "pip", "uninstall", "-y", PACKAGE_NAME], check=True, shell=False)
+    subprocess.run([str(python), "-m", "pip", "install", str(source_dir)], check=True, shell=False)
 
     probe = subprocess.run(
         [
@@ -171,6 +207,7 @@ def main() -> int:
         check=True,
         capture_output=True,
         text=True,
+        shell=False,
     )
     installed_from = Path(probe.stdout.strip()).resolve()
     if installed_from.parent == source_package:

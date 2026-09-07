@@ -6,6 +6,10 @@ Telegram API hashes, login codes, two-step passwords, Telethon session files, an
 
 Do not include them in commits, releases, screenshots, logs, or public GitHub issues. The project stores normal authentication state outside the repository in the operating system's per-user application-data directory.
 
+The Telegram API hash is persisted only through an OS-backed credential store. If secure credential storage is unavailable, the application does not write the API hash to disk. Telethon session files are still sensitive bearer credentials and are restricted to the current user on POSIX systems. New TDLib databases use a random encryption key stored through the secure credential-store layer; TDLib falls back rather than creating a new unencrypted database when that secure storage is unavailable.
+
+Native TDLib libraries are loaded only from the project's pinned runtime or standard system/package-manager locations. Arbitrary environment-variable native-library overrides are intentionally rejected.
+
 If a Telegram session may have been exposed, revoke that session from Telegram **Settings → Devices** and authorize the tool again.
 
 ## Reporting a vulnerability

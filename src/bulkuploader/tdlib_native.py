@@ -1,34 +1,42 @@
 from __future__ import annotations
 
+import base64
+import contextlib
 import ctypes
 import getpass
 import hashlib
+import http.client
 import json
 import os
 import platform
+import secrets
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
 import time
-import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from platformdirs import user_data_dir
+from bulkuploader.paths import app_data_dir
 
 APP_NAME = "telegram-uploader"
 APP_VERSION = "1.0.1"
-DATA_DIR = Path(user_data_dir(APP_NAME, appauthor=False))
+DATA_DIR = app_data_dir()
 TDLIB_ROOT = DATA_DIR / "tdlib"
 TDLIB_DB_DIR = DATA_DIR / "tdlib-native-db"
 TDLIB_FILES_DIR = DATA_DIR / "tdlib-native-files"
+TDLIB_DB_KEY_NAME = "tdlib-database-encryption-key"
 
-SQLCIPHER_URL = "https://archive.ubuntu.com/ubuntu/pool/universe/s/sqlcipher/libsqlcipher1_4.5.6-1build2_amd64.deb"
+UBUNTU_ARCHIVE_HOST = "archive.ubuntu.com"
+SQLCIPHER_ARCHIVE_PATH = "/ubuntu/pool/universe/s/sqlcipher/libsqlcipher1_4.5.6-1build2_amd64.deb"
+SQLCIPHER_URL = f"https://{UBUNTU_ARCHIVE_HOST}{SQLCIPHER_ARCHIVE_PATH}"
 SQLCIPHER_SHA256 = "30ffc3589facffbd72fc8720fb5ab7448b4dfb6e99929f0f41b4b3321f45a611"
-TDJSON_URL = "https://archive.ubuntu.com/ubuntu/pool/universe/t/td/libtdjson1.8.38_1.8.38~git20241021.d321984+dfsg-4_amd64.deb"
+TDJSON_ARCHIVE_PATH = "/ubuntu/pool/universe/t/td/libtdjson1.8.38_1.8.38~git20241021.d321984+dfsg-4_amd64.deb"
+TDJSON_URL = f"https://{UBUNTU_ARCHIVE_HOST}{TDJSON_ARCHIVE_PATH}"
 TDJSON_SHA256 = "250f2f51b4fae813ab166a0c12b1845e1ac5752cc66d74e43bdcd3e185e6401b"
 
 
@@ -38,6 +46,20 @@ def _secure_dir(path: Path) -> None:
         path.chmod(0o700)
     except OSError:
         pass
+
+
+def _new_database_key() -> str:
+    # TDLib's JSON interface represents bytes values as base64 strings.
+    return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+def _directory_has_state(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    try:
+        return any(path.iterdir())
+    except OSError:
+        return True
 
 
 def _sha256(path: Path) -> str:
@@ -65,36 +87,52 @@ def _bundled_runtime_supported() -> bool:
 
 
 def _homebrew_prefix() -> Path | None:
-    brew = shutil.which("brew")
-    if not brew:
+    # Homebrew exposes stable `opt/<formula>` paths. Use only the standard
+    # installation prefixes instead of PATH/environment-controlled executables.
+    for candidate in (
+        Path("/opt/homebrew/opt/tdlib"),
+        Path("/usr/local/opt/tdlib"),
+        Path("/home/linuxbrew/.linuxbrew/opt/tdlib"),
+    ):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _trusted_brew_executable() -> str | None:
+    for candidate in (
+        Path("/opt/homebrew/bin/brew"),
+        Path("/usr/local/bin/brew"),
+        Path("/home/linuxbrew/.linuxbrew/bin/brew"),
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _windows_program_files() -> Path | None:
+    if _platform_name() != "windows":
         return None
     try:
-        result = subprocess.run(
-            [brew, "--prefix", "tdlib"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        buffer = ctypes.create_unicode_buffer(32768)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0026, None, 0, buffer)
+    except Exception:
         return None
-    if result.returncode != 0:
+    if result != 0 or not buffer.value:
         return None
-    value = result.stdout.strip()
-    return Path(value) if value else None
+    return Path(buffer.value)
 
 
 def _vcpkg_root() -> Path | None:
-    raw = os.environ.get("VCPKG_ROOT", "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if p.exists():
-            return p
-    executable = shutil.which("vcpkg")
-    if executable:
-        p = Path(executable).resolve().parent
-        if (p / "installed").exists():
-            return p
+    # Accept only Visual Studio's well-known Program Files installations. Do not
+    # discover vcpkg through PATH or VCPKG_ROOT because native DLLs are executable code.
+    program_files = _windows_program_files()
+    if program_files is None:
+        return None
+    for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+        candidate = program_files / "Microsoft Visual Studio" / "2022" / edition / "VC" / "vcpkg"
+        if (candidate / "vcpkg.exe").is_file() and (candidate / "installed").is_dir():
+            return candidate
     return None
 
 
@@ -141,17 +179,13 @@ def _candidate_tdlib_paths(root: Path) -> list[Path]:
                     vcpkg_root / "installed" / machine / "debug" / "bin" / "tdjson.dll",
                 ]
             )
-        path_hit = shutil.which("tdjson.dll")
-        if path_hit:
-            candidates.append(Path(path_hit))
     return candidates
 
 
 def tdlib_library_path(root: Path = TDLIB_ROOT) -> Path | None:
-    override = os.environ.get("TDLIB_LIBRARY", "").strip()
-    if override:
-        p = Path(override).expanduser()
-        return p if p.is_file() else None
+    # Native libraries are loaded only from app-owned/runtime locations or known
+    # package-manager/system locations. Environment-controlled library paths are
+    # intentionally not accepted because loading a DLL/.so executes native code.
     return next((p for p in _candidate_tdlib_paths(root) if p.is_file()), None)
 
 
@@ -167,9 +201,9 @@ def tdlib_setup_hint() -> str:
     if system == "darwin":
         return "Install Homebrew TDLib with `brew install tdlib`, then run `telegram login` again."
     if system == "windows":
-        return "Install TDLib with vcpkg (`vcpkg install tdlib`) or set TDLIB_LIBRARY to tdjson.dll, then run `telegram login` again."
+        return "Install TDLib with vcpkg (`vcpkg install tdlib`), then run `telegram login` again."
     if system == "linux":
-        return "Install system TDLib or Homebrew TDLib, or set TDLIB_LIBRARY to libtdjson.so."
+        return "Install system TDLib or Homebrew TDLib, then run `telegram login` again."
     return "TDLib is optional on this platform; Telethon remains available as the transfer engine."
 
 
@@ -201,7 +235,7 @@ def tdlib_runtime_status(root: Path = TDLIB_ROOT) -> dict[str, object]:
     return {
         "supported": _platform_supported(),
         "bundled_install_supported": _bundled_runtime_supported(),
-        "auto_install_supported": _bundled_runtime_supported() or (_platform_name() == "darwin" and shutil.which("brew") is not None),
+        "auto_install_supported": _bundled_runtime_supported() or (_platform_name() == "darwin" and _trusted_brew_executable() is not None),
         "installed": installed,
         "library": str(lib) if lib else None,
         "sqlcipher": str(sqlcipher) if sqlcipher else None,
@@ -211,11 +245,50 @@ def tdlib_runtime_status(root: Path = TDLIB_ROOT) -> dict[str, object]:
 
 
 def _download_checked(url: str, expected_sha256: str, destination: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": f"tg-uploader/{APP_VERSION}"})
-    with urllib.request.urlopen(req, timeout=60) as response, destination.open("wb") as out:
-        shutil.copyfileobj(response, out, length=1024 * 1024)
+    if url == SQLCIPHER_URL:
+        archive_path = SQLCIPHER_ARCHIVE_PATH
+    elif url == TDJSON_URL:
+        archive_path = TDJSON_ARCHIVE_PATH
+    else:
+        raise RuntimeError("TDLib runtime downloads are restricted to the project's pinned Ubuntu archive packages.")
+
+    # Semgrep's version-generic HTTPSConnection audit also covers old Python releases
+    # that did not verify certificates by default. This project requires Python 3.10+
+    # and passes an explicit default verification context, so that specific advisory
+    # is not applicable here.
+    connection = http.client.HTTPSConnection(  # nosemgrep: python.lang.security.audit.httpsconnection-detected.httpsconnection-detected
+        UBUNTU_ARCHIVE_HOST,
+        timeout=60,
+        context=ssl.create_default_context(),
+    )
+    try:
+        connection.request(
+            "GET",
+            archive_path,
+            headers={"User-Agent": f"tg-uploader/{APP_VERSION}"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            raise RuntimeError(
+                f"TDLib runtime download failed with HTTP {response.status} from the pinned Ubuntu archive."
+            )
+        with destination.open("wb") as out:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except Exception:
+        with contextlib.suppress(OSError):
+            destination.unlink()
+        raise
+    finally:
+        connection.close()
+
     actual = _sha256(destination)
     if actual != expected_sha256:
+        with contextlib.suppress(OSError):
+            destination.unlink()
         raise RuntimeError(
             f"TDLib runtime package checksum mismatch for {destination.name}: expected {expected_sha256}, got {actual}"
         )
@@ -228,8 +301,10 @@ def install_tdlib_runtime(root: Path = TDLIB_ROOT, force: bool = False) -> dict[
 
     system = _platform_name()
     if _bundled_runtime_supported():
-        if shutil.which("dpkg-deb") is None:
-            raise RuntimeError("dpkg-deb is required to unpack the local TDLib runtime on Linux.")
+        dpkg_deb_path = Path("/usr/bin/dpkg-deb")
+        if not dpkg_deb_path.is_file():
+            raise RuntimeError("/usr/bin/dpkg-deb is required to unpack the local TDLib runtime on Linux.")
+        dpkg_deb = str(dpkg_deb_path)
         _secure_dir(root.parent)
         with tempfile.TemporaryDirectory(prefix="tdlib-install-", dir=str(root.parent)) as tmp_name:
             tmp = Path(tmp_name)
@@ -239,8 +314,8 @@ def install_tdlib_runtime(root: Path = TDLIB_ROOT, force: bool = False) -> dict[
             staged.mkdir()
             _download_checked(SQLCIPHER_URL, SQLCIPHER_SHA256, sql_deb)
             _download_checked(TDJSON_URL, TDJSON_SHA256, td_deb)
-            subprocess.run(["dpkg-deb", "-x", str(sql_deb), str(staged)], check=True)
-            subprocess.run(["dpkg-deb", "-x", str(td_deb), str(staged)], check=True)
+            subprocess.run([dpkg_deb, "-x", str(sql_deb), str(staged)], check=True, shell=False)
+            subprocess.run([dpkg_deb, "-x", str(td_deb), str(staged)], check=True, shell=False)
             if not tdlib_library_path(staged) or not tdlib_sqlcipher_path(staged):
                 raise RuntimeError("Downloaded TDLib packages did not contain the expected runtime libraries.")
             if root.exists():
@@ -250,29 +325,24 @@ def install_tdlib_runtime(root: Path = TDLIB_ROOT, force: bool = False) -> dict[
         return tdlib_runtime_status(root)
 
     if system in {"darwin", "linux"}:
-        brew = shutil.which("brew")
+        brew = _trusted_brew_executable()
         if brew:
-            subprocess.run([brew, "install", "tdlib"], check=True)
+            subprocess.run([brew, "install", "tdlib"], check=True, shell=False)
             status = tdlib_runtime_status(root)
             if status["installed"]:
                 return status
-            raise RuntimeError("Homebrew finished, but libtdjson could not be located. Set TDLIB_LIBRARY to the installed libtdjson path.")
+            raise RuntimeError("Homebrew finished, but libtdjson could not be located in a standard Homebrew TDLib location.")
 
     if system == "windows":
-        vcpkg = shutil.which("vcpkg")
-        if not vcpkg:
-            candidate = _vcpkg_root()
-            if candidate:
-                exe = candidate / "vcpkg.exe"
-                if exe.is_file():
-                    vcpkg = str(exe)
+        candidate = _vcpkg_root()
+        vcpkg = str(candidate / "vcpkg.exe") if candidate else None
         if vcpkg:
             triplet = "arm64-windows" if _machine_name() in {"arm64", "aarch64"} else "x64-windows"
-            subprocess.run([vcpkg, "install", f"tdlib:{triplet}"], check=True)
+            subprocess.run([vcpkg, "install", f"tdlib:{triplet}"], check=True, shell=False)
             status = tdlib_runtime_status(root)
             if status["installed"]:
                 return status
-            raise RuntimeError("vcpkg finished, but tdjson.dll could not be located. Set TDLIB_LIBRARY to the installed tdjson.dll path.")
+            raise RuntimeError("vcpkg finished, but tdjson.dll could not be located in the expected Visual Studio vcpkg installation.")
 
     raise RuntimeError(str(status["setup_hint"]))
 
@@ -410,40 +480,100 @@ class TDLibNativeClient:
     """Persistent TDLib user client used for the native upload benchmark/transport."""
 
     def __init__(self, api_id: int, api_hash: str, root: Path = TDLIB_ROOT):
+        from bulkuploader.secure_store import get_secret, set_secret
+
         self.api_id = int(api_id)
         self.api_hash = str(api_hash)
         self.root = root
-        self.td = TDJson(root)
         self.ready = False
         self._authorization_state = "unknown"
+
+        for directory in (TDLIB_DB_DIR, TDLIB_FILES_DIR):
+            if directory.is_symlink():
+                raise RuntimeError(f"Refusing to use symlinked TDLib data directory: {directory}")
+        had_database_state = _directory_has_state(TDLIB_DB_DIR)
         _secure_dir(TDLIB_DB_DIR)
         _secure_dir(TDLIB_FILES_DIR)
+
+        stored_key = get_secret(TDLIB_DB_KEY_NAME)
+        self._database_key = stored_key or ""
+        self._pending_database_key: str | None = None
+        if not stored_key:
+            candidate = _new_database_key()
+            if had_database_state:
+                # Existing installations used an empty key. Open that database once,
+                # then migrate it to an OS-keyring-backed random key at Ready state.
+                self._pending_database_key = candidate
+            else:
+                if not set_secret(TDLIB_DB_KEY_NAME, candidate):
+                    raise RuntimeError(
+                        "Secure OS credential storage is unavailable; refusing to create an unencrypted TDLib database. "
+                        "Telethon fallback remains available."
+                    )
+                self._database_key = candidate
+
+        self.td = TDJson(root)
 
     @property
     def authorization_state(self) -> str:
         return self._authorization_state
 
+    def _parameter_payload(self, database_key: str) -> dict:
+        return {
+            "@type": "setTdlibParameters",
+            "use_test_dc": False,
+            "database_directory": str(TDLIB_DB_DIR),
+            "files_directory": str(TDLIB_FILES_DIR),
+            "database_encryption_key": database_key,
+            "use_file_database": True,
+            "use_chat_info_database": True,
+            "use_message_database": False,
+            "use_secret_chats": False,
+            "api_id": self.api_id,
+            "api_hash": self.api_hash,
+            "system_language_code": "en",
+            "device_model": "TG Uploader",
+            "system_version": platform.platform(),
+            "application_version": APP_VERSION,
+        }
+
     def _set_parameters(self) -> None:
-        self.td.request(
-            {
-                "@type": "setTdlibParameters",
-                "use_test_dc": False,
-                "database_directory": str(TDLIB_DB_DIR),
-                "files_directory": str(TDLIB_FILES_DIR),
-                "database_encryption_key": "",
-                "use_file_database": True,
-                "use_chat_info_database": True,
-                "use_message_database": False,
-                "use_secret_chats": False,
-                "api_id": self.api_id,
-                "api_hash": self.api_hash,
-                "system_language_code": "en",
-                "device_model": "TG Uploader",
-                "system_version": platform.platform(),
-                "application_version": APP_VERSION,
-            },
-            timeout=30,
-        )
+        from bulkuploader.secure_store import delete_secret
+
+        try:
+            self.td.request(self._parameter_payload(self._database_key), timeout=30)
+        except RuntimeError as exc:
+            # If a key was saved but the prior process died before TDLib actually
+            # changed an older unencrypted database, recover by trying the legacy
+            # empty key once and re-running the migration safely.
+            if self._database_key and "401" in str(exc):
+                delete_secret(TDLIB_DB_KEY_NAME)
+                self._database_key = ""
+                self._pending_database_key = _new_database_key()
+                self.td.request(self._parameter_payload(""), timeout=30)
+                return
+            raise
+
+    def _migrate_database_encryption(self) -> None:
+        candidate = getattr(self, "_pending_database_key", None)
+        if not candidate:
+            return
+        from bulkuploader.secure_store import delete_secret, set_secret
+
+        if not set_secret(TDLIB_DB_KEY_NAME, candidate):
+            raise RuntimeError(
+                "Secure OS credential storage is unavailable; refusing to keep the TDLib database unencrypted."
+            )
+        try:
+            self.td.request(
+                {"@type": "setDatabaseEncryptionKey", "new_encryption_key": candidate},
+                timeout=30,
+            )
+        except Exception:
+            delete_secret(TDLIB_DB_KEY_NAME)
+            raise
+        self._database_key = candidate
+        self._pending_database_key = None
 
     def _handle_authorization_state(
         self,
@@ -458,7 +588,22 @@ class TDLibNativeClient:
             self._set_parameters()
             return None
         if state_type == "authorizationStateWaitEncryptionKey":
-            self.td.request({"@type": "checkDatabaseEncryptionKey", "encryption_key": ""})
+            try:
+                self.td.request(
+                    {"@type": "checkDatabaseEncryptionKey", "encryption_key": self._database_key}
+                )
+            except RuntimeError:
+                # A previous migration may have persisted the new key immediately
+                # before TDLib changed the legacy empty-key database. Retry the
+                # legacy empty key once and finish that pending migration at Ready.
+                if not self._database_key:
+                    raise
+                pending_key = self._database_key
+                self.td.request(
+                    {"@type": "checkDatabaseEncryptionKey", "encryption_key": ""}
+                )
+                self._database_key = ""
+                self._pending_database_key = pending_key
             return None
         if state_type == "authorizationStateWaitPhoneNumber":
             if not interactive:
@@ -483,6 +628,7 @@ class TDLibNativeClient:
         if state_type in {"authorizationStateWaitEmailAddress", "authorizationStateWaitEmailCode", "authorizationStateWaitPremiumPurchase"}:
             raise RuntimeError(f"TDLib requires an unsupported authorization step: {state_type}")
         if state_type == "authorizationStateReady":
+            self._migrate_database_encryption()
             self.ready = True
             return True
         if state_type in {"authorizationStateClosing", "authorizationStateClosed", "authorizationStateLoggingOut"}:

@@ -26,9 +26,9 @@ The core client uses Telethon and works without a browser after one-time authori
 | Platform | Core Telegram CLI | TDLib acceleration |
 | --- | --- | --- |
 | Linux x86_64 | Yes | Bundled local runtime can be installed automatically during setup |
-| Linux other architectures | Yes | Use a compatible system/Homebrew TDLib or `TDLIB_LIBRARY` |
-| macOS | Yes | Homebrew TDLib (`brew install tdlib`) |
-| Windows | Yes | vcpkg TDLib or `TDLIB_LIBRARY` pointing to `tdjson.dll` |
+| Linux other architectures | Yes | Use a compatible system or standard Homebrew TDLib installation |
+| macOS | Yes | Standard Homebrew TDLib (`brew install tdlib`) |
+| Windows | Yes | Visual Studio vcpkg TDLib installation |
 
 TDLib is optional. If it is unavailable, `telegram login` still finishes successfully with the Telethon transfer engine.
 
@@ -90,21 +90,21 @@ telegram login
 On a new installation the setup flow is:
 
 ```text
-Telegram setup
-✓ API credentials saved locally
+TG Uploader setup
+✓ API configuration ready
 ✓ Control session authorized
 ✓ Fast-transfer session authorized   # when TDLib is available
 Setup complete.
 ```
 
-Your `api_id` and `api_hash` are entered **once** and reused by both Telegram client sessions.
+Your `api_id` is saved in the per-user application-data directory. Your `api_hash` is stored only through an OS-backed credential store when one is available. If secure credential storage is unavailable, the API hash is not written to disk and may be requested again on a later run.
 
 Internally there can be two local Telegram sessions:
 
 1. **Control session (Telethon)** — account access, destinations, text messaging, and transfer fallback.
 2. **Fast-transfer session (TDLib)** — optional native file-transfer engine.
 
-On a fresh TDLib setup, Telegram may therefore send one login code for the control session and another for the fast-transfer session. The same API ID/hash and phone number are reused automatically within the setup flow. After both are authorized, normal daily use does not ask for them again unless a session is revoked or deleted.
+On a fresh TDLib setup, Telegram may therefore send one login code for the control session and another for the fast-transfer session. The same API ID/hash and phone number are reused automatically within that setup run. After both sessions are authorized, normal daily use does not ask for Telegram login codes again unless a session is revoked or deleted; the API hash may be requested again only on systems where secure credential storage is unavailable.
 
 If TDLib is not installed on macOS or Windows, setup completes with Telethon. To enable the optional native engine later:
 
@@ -113,7 +113,7 @@ telegram native setup
 telegram login
 ```
 
-`telegram native setup` may use the platform package manager when available (Homebrew on macOS/Linux or vcpkg on Windows). Linux x86_64 also supports the project's pinned local TDLib runtime without system installation.
+`telegram native setup` uses only standard package-manager locations (Homebrew on macOS/Linux or Visual Studio vcpkg on Windows). Linux x86_64 also supports the project's pinned local TDLib runtime without system installation.
 
 ## Commands
 
@@ -209,7 +209,9 @@ The repository is source-only. `.gitignore` excludes common local secrets and ru
 - local SQLite upload history.
 - `.env` files.
 
-The application stores its own configuration/session state in the operating system's per-user application-data directory, not inside the repository. No application telemetry is implemented.
+The application stores its own configuration/session state in the operating system's per-user application-data directory, not inside the repository. The Telegram API ID may be stored there, but the API hash is persisted only through an OS-backed credential store; if no secure credential store is available, the API hash is not written to disk. Telethon session files remain sensitive login credentials and are restricted to the current user on POSIX systems. New TDLib databases use a random encryption key stored through the same secure credential-store layer; if that secure storage is unavailable, the native TDLib path is not allowed to create an unencrypted database and Telethon remains available as fallback. No application telemetry is implemented.
+
+Native TDLib libraries are loaded only from the application's pinned runtime or standard system/package-manager locations. Environment-variable overrides for arbitrary native libraries are intentionally not accepted.
 
 If a Telegram session is ever exposed, revoke it from Telegram **Settings → Devices** and authorize the tool again.
 

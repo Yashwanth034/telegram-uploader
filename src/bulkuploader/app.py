@@ -8,7 +8,6 @@ import json
 import math
 import os
 import secrets
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -24,16 +23,17 @@ except ImportError:
     def blake3():
         return hashlib.blake2b(digest_size=32)
 
-from platformdirs import user_data_dir
+from bulkuploader.paths import app_data_dir
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
 APP_NAME = "telegram-uploader"
-DATA_DIR = Path(user_data_dir(APP_NAME, appauthor=False))
+DATA_DIR = app_data_dir()
 DB_PATH = DATA_DIR / "state.sqlite3"
 TELEGRAM_CONFIG_PATH = DATA_DIR / "telegram-api.json"
 TELEGRAM_SESSION_BASE = DATA_DIR / "telegram-mtproto"
+TELEGRAM_API_HASH_KEY_PREFIX = "telegram-api-hash"
 TELEGRAM_PART_SIZE = 512 * 1024
 TELEGRAM_BIG_FILE_THRESHOLD = 10 * 1024 * 1024
 TELEGRAM_MIN_PART_WORKERS = 8
@@ -401,21 +401,30 @@ def scan_paths(inputs: Iterable[Path], db: StateDB) -> list[FileRecord]:
     return records
 
 
+def _trusted_gui_picker(name: str) -> str | None:
+    if name not in {"zenity", "kdialog"} or os.name == "nt":
+        return None
+    candidate = Path("/usr/bin") / name
+    return str(candidate) if candidate.is_file() else None
+
+
 def choose_native_paths() -> list[Path]:
     mode = console.input("Select [F]iles or a [D]irectory? [F/d]: ").strip().lower()
     want_dir = mode == "d"
-    if shutil.which("zenity"):
-        cmd = ["zenity", "--file-selection"]
+    zenity = _trusted_gui_picker("zenity")
+    if zenity:
+        cmd = [zenity, "--file-selection"]
         if want_dir:
             cmd.append("--directory")
         else:
             cmd += ["--multiple", "--separator=\n"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
         if result.returncode == 0:
             return [Path(x) for x in result.stdout.splitlines() if x.strip()]
-    if shutil.which("kdialog"):
-        cmd = ["kdialog", "--getexistingdirectory", "."] if want_dir else ["kdialog", "--getopenfilename", ".", "*", "--multiple"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+    kdialog = _trusted_gui_picker("kdialog")
+    if kdialog:
+        cmd = [kdialog, "--getexistingdirectory", "."] if want_dir else [kdialog, "--getopenfilename", ".", "*", "--multiple"]
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
         if result.returncode == 0:
             return [Path(x) for x in result.stdout.splitlines() if x.strip()]
     try:
@@ -449,43 +458,109 @@ def parse_path_input(line: str, windows: bool | None = None) -> list[Path]:
     return cleaned
 
 
-def _load_telegram_api_config() -> tuple[int, str] | None:
+def _telegram_api_hash_key(api_id: int) -> str:
+    return f"{TELEGRAM_API_HASH_KEY_PREFIX}:{int(api_id)}"
+
+
+def _read_saved_telegram_api_id() -> int | None:
     env_id = os.environ.get("TELEGRAM_API_ID", "").strip()
-    env_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
-    if env_id and env_hash:
-        return int(env_id), env_hash
+    if env_id:
+        try:
+            value = int(env_id)
+        except ValueError:
+            return None
+        return value if value > 0 else None
     if not TELEGRAM_CONFIG_PATH.exists():
         return None
     try:
-        data = json.loads(TELEGRAM_CONFIG_PATH.read_text())
-        return int(data["api_id"]), str(data["api_hash"])
+        data = json.loads(TELEGRAM_CONFIG_PATH.read_text(encoding="utf-8"))
+        value = int(data["api_id"])
+        return value if value > 0 else None
     except Exception:
         return None
 
 
-def _save_telegram_api_config(api_id: int, api_hash: str) -> None:
-    TELEGRAM_CONFIG_PATH.write_text(json.dumps({"api_id": api_id, "api_hash": api_hash}))
+def _write_telegram_api_id(api_id: int) -> None:
+    _secure_dir(TELEGRAM_CONFIG_PATH.parent)
+    tmp = TELEGRAM_CONFIG_PATH.with_name(TELEGRAM_CONFIG_PATH.name + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"api_id": int(api_id)}, fh)
+            fh.write("\n")
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    os.replace(tmp, TELEGRAM_CONFIG_PATH)
     _secure_file(TELEGRAM_CONFIG_PATH)
+
+
+def _load_telegram_api_config() -> tuple[int, str] | None:
+    from bulkuploader.secure_store import get_secret, set_secret
+
+    api_id = _read_saved_telegram_api_id()
+    if api_id is None:
+        return None
+
+    # Migrate old v1.0.x config files that stored the Telegram API hash beside
+    # the API ID. The legacy value is used only for this process, moved into an
+    # OS-backed credential store when available, and removed from disk either way.
+    try:
+        data = json.loads(TELEGRAM_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    legacy_hash = str(data.get("api_hash", "")).strip()
+    if legacy_hash:
+        set_secret(_telegram_api_hash_key(api_id), legacy_hash)
+        _write_telegram_api_id(api_id)
+        return api_id, legacy_hash
+
+    stored_hash = get_secret(_telegram_api_hash_key(api_id))
+    return (api_id, stored_hash) if stored_hash else None
+
+
+def _save_telegram_api_config(api_id: int, api_hash: str) -> bool:
+    from bulkuploader.secure_store import set_secret
+
+    _write_telegram_api_id(api_id)
+    return set_secret(_telegram_api_hash_key(api_id), api_hash)
 
 
 def _configure_telegram_api_interactive() -> tuple[int, str]:
     existing = _load_telegram_api_config()
     if existing:
         return existing
+
     console.print("Telegram MTProto setup (one time)")
-    console.print("Enter your Telegram API credentials locally; they are stored only on this computer.")
-    while True:
-        raw_id = console.input("API ID: ").strip()
-        if raw_id.isdigit() and int(raw_id) > 0:
-            api_id = int(raw_id)
-            break
-        console.print("[yellow]API ID must be a positive number.[/]")
+    console.print("API ID is saved locally. API hash is stored only in a secure OS credential store when available.")
+    saved_id = _read_saved_telegram_api_id()
+    if saved_id is not None:
+        api_id = saved_id
+        console.print("[green]✓[/] API ID already saved")
+    else:
+        while True:
+            raw_id = console.input("API ID: ").strip()
+            if raw_id.isdigit() and int(raw_id) > 0:
+                api_id = int(raw_id)
+                break
+            console.print("[yellow]API ID must be a positive number.[/]")
+
     while True:
         api_hash = getpass.getpass("API hash: ").strip()
         if api_hash:
             break
         console.print("[yellow]API hash cannot be empty.[/]")
-    _save_telegram_api_config(api_id, api_hash)
+
+    persisted = _save_telegram_api_config(api_id, api_hash)
+    if not persisted:
+        console.print(
+            "[yellow]Secure OS credential storage is unavailable, so the API hash was not saved to disk.[/]"
+        )
+        console.print(
+            "[dim]This run can continue, but a future run will ask for the API hash again.[/]"
+        )
     return api_id, api_hash
 
 
@@ -1019,7 +1094,9 @@ class TelegramDirect:
         part_count = math.ceil(size / part_size)
         file_id = secrets.randbits(63)
         is_big = size > TELEGRAM_BIG_FILE_THRESHOLD
-        md5 = hashlib.md5() if not is_big else None
+        # Telegram's small-file MTProto API requires an MD5 checksum as a
+        # protocol field; it is not used here for security decisions.
+        md5 = hashlib.md5(usedforsecurity=False) if not is_big else None
         part_index = 0
 
         # Read only a bounded window into memory at a time. Each file may prepare a
@@ -1810,9 +1887,8 @@ def _ensure_tdlib_login_interactive(phone: str | None = None) -> bool:
 def login() -> int:
     console.print("[bold]TG Uploader setup[/]")
     console.print("[dim]Independent third-party client for Telegram; not affiliated with or endorsed by Telegram.[/]")
-    config_existed = _load_telegram_api_config() is not None
     _configure_telegram_api_interactive()
-    console.print(f"[green]✓[/] API credentials {'already saved' if config_existed else 'saved locally'}")
+    console.print("[green]✓[/] API configuration ready")
 
     adapter = TelegramDirect().connect(require_login=False)
     native_was_ready = adapter._native_engine
