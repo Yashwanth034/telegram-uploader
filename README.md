@@ -11,6 +11,7 @@ The core client uses Telethon and works without a browser after one-time authori
 - Windows, macOS, and Linux terminal support.
 - Channels, Groups, Chats, direct `@username`, and Saved Messages.
 - Recursive file/folder batches.
+- Public Telegram channel media downloads with resume and duplicate protection.
 - Optional native TDLib/C++ transfer acceleration.
 - Telethon fallback when TDLib is not installed or not ready.
 - BLAKE3 content-based duplicate protection per Telegram destination.
@@ -122,7 +123,11 @@ telegram
 telegram @username
 telegram login
 telegram doctor
+telegram --version
 telegram resume
+telegram download @publicchannel
+telegram download https://t.me/publicchannel
+telegram download resume
 ```
 
 TDLib diagnostics and benchmarking:
@@ -182,6 +187,37 @@ Esc                 cancel
 ```
 
 Text is sent literally with Telegram formatting disabled, so underscores, asterisks, URLs, and code-like text are not accidentally reformatted.
+
+## Public channel downloads
+
+Download media from a public Telegram broadcast channel using the same locally authorized Telegram account:
+
+```bash
+telegram download @publicchannel
+telegram download https://t.me/publicchannel
+```
+
+The downloader accepts public channel usernames and `t.me` links only. Private/invite-only links are intentionally rejected. It downloads media through Telegram/Telethon rather than scraping Telegram Web.
+
+Before downloading, TG Uploader scans the channel and shows the message count, media count, and total media size. You then choose **All media/files, Videos, Images, Documents, or Audio**, or choose **Back** without creating a download job. The selected filter is persisted with the resumable job.
+
+Downloads use a bounded four-file concurrent window so batches of small/medium media can use available bandwidth more effectively without opening an unbounded number of Telegram requests. Actual throughput still depends on Telegram, routing, account/server limits, and file sizes.
+
+By default, files are stored under your user Downloads folder in `TG Uploader/<channel name>`. You can choose another local folder when prompted. Remote filenames are sanitized and downloads are written to `.part` files first, then renamed only after completion.
+
+Download duplicate protection is layered:
+
+- The same channel message is not downloaded twice when its completed file still exists.
+- Reused Telegram media IDs in another message are skipped without another network download.
+- BLAKE3 content fingerprints prevent identical bytes from creating a second local copy even when Telegram exposes them as different media IDs.
+
+Interrupted or partially failed download jobs remain local and can be resumed with:
+
+```bash
+telegram download resume
+```
+
+Completed media are skipped during resume, so the downloader continues with only work that is still missing. Telegram rate-limit responses are treated as a channel-wide cooldown rather than as hundreds of individual file failures.
 
 ## Resume and duplicate protection
 

@@ -10,6 +10,10 @@ The Telegram API hash is persisted only through an OS-backed credential store. I
 
 Native TDLib libraries are loaded only from the project's pinned runtime or standard system/package-manager locations. Arbitrary environment-variable native-library overrides are intentionally rejected.
 
+Public-channel downloading accepts public broadcast-channel usernames/links only; private or invite-only links are intentionally rejected. Telegram-provided filenames are sanitized before local use, downloads are written through temporary `.part` files, and completed download state is kept only in the per-user local database. Download duplicate detection uses Telegram media identity and BLAKE3 content fingerprints; it does not upload local download history or file contents anywhere except the Telegram requests explicitly initiated by the user.
+
+Telegram rate-limit responses are treated as a global cooldown. The client stops additional requests and preserves unfinished work instead of repeatedly retrying files during Telegram's requested wait period.
+
 If a Telegram session may have been exposed, revoke that session from Telegram **Settings → Devices** and authorize the tool again.
 
 ## Reporting a vulnerability

@@ -88,6 +88,45 @@ def test_windows_launcher_content_uses_relative_runtime_path():
     assert ":\\" not in content
 
 
+def test_installer_main_reuses_existing_valid_venv_on_upgrade(tmp_path, monkeypatch):
+    installer = _load_installer()
+    root = tmp_path / "data"
+    venv_dir = root / "runtime" / "venv"
+    python = installer.venv_python(venv_dir)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("", encoding="utf-8")
+    created = []
+
+    class FakeBuilder:
+        def create(self, target):
+            created.append(target)
+            raise AssertionError("existing valid venv must be reused")
+
+    def fake_run(args, **kwargs):
+        class Result:
+            stdout = ""
+
+        if "-c" in args:
+            code = args[args.index("-c") + 1]
+            if "importlib.metadata" in code:
+                Result.stdout = installer._source_package_version(Path(__file__).resolve().parents[1]) + "\n"
+            else:
+                installed = tmp_path / "installed" / "bulkuploader" / "__init__.py"
+                installed.parent.mkdir(parents=True, exist_ok=True)
+                installed.write_text("", encoding="utf-8")
+                Result.stdout = f"{installed}\n"
+        return Result()
+
+    monkeypatch.setattr(installer, "app_data_root", lambda: root)
+    monkeypatch.setattr(installer, "command_home", lambda _root: tmp_path / "bin")
+    monkeypatch.setattr(installer.venv, "EnvBuilder", lambda **_kwargs: FakeBuilder())
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setattr(installer, "_install_launcher", lambda venv_dir, bin_home: False)
+
+    assert installer.main() == 0
+    assert created == []
+
+
 def test_installer_main_uses_venv_module_without_name_collision(tmp_path, monkeypatch, capsys):
     installer = _load_installer()
     root = tmp_path / "data"
@@ -105,10 +144,14 @@ def test_installer_main_uses_venv_module_without_name_collision(tmp_path, monkey
             stdout = ""
 
         if "-c" in args:
-            installed = tmp_path / "installed" / "bulkuploader" / "__init__.py"
-            installed.parent.mkdir(parents=True, exist_ok=True)
-            installed.write_text("", encoding="utf-8")
-            Result.stdout = f"{installed}\n"
+            code = args[args.index("-c") + 1]
+            if "importlib.metadata" in code:
+                Result.stdout = installer._source_package_version(Path(__file__).resolve().parents[1]) + "\n"
+            else:
+                installed = tmp_path / "installed" / "bulkuploader" / "__init__.py"
+                installed.parent.mkdir(parents=True, exist_ok=True)
+                installed.write_text("", encoding="utf-8")
+                Result.stdout = f"{installed}\n"
         return Result()
 
     monkeypatch.setattr(installer, "app_data_root", lambda: root)

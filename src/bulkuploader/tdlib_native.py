@@ -24,20 +24,20 @@ from typing import Callable
 from bulkuploader.paths import app_data_dir
 
 APP_NAME = "telegram-uploader"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 DATA_DIR = app_data_dir()
 TDLIB_ROOT = DATA_DIR / "tdlib"
 TDLIB_DB_DIR = DATA_DIR / "tdlib-native-db"
 TDLIB_FILES_DIR = DATA_DIR / "tdlib-native-files"
-TDLIB_DB_KEY_NAME = "tdlib-database-encryption-key"
+TDLIB_DB_KEY_NAME = "tdlib-database-encryption-key"  # pragma: allowlist secret
 
 UBUNTU_ARCHIVE_HOST = "archive.ubuntu.com"
 SQLCIPHER_ARCHIVE_PATH = "/ubuntu/pool/universe/s/sqlcipher/libsqlcipher1_4.5.6-1build2_amd64.deb"
 SQLCIPHER_URL = f"https://{UBUNTU_ARCHIVE_HOST}{SQLCIPHER_ARCHIVE_PATH}"
-SQLCIPHER_SHA256 = "30ffc3589facffbd72fc8720fb5ab7448b4dfb6e99929f0f41b4b3321f45a611"
+SQLCIPHER_SHA256 = "30ffc3589facffbd72fc8720fb5ab7448b4dfb6e99929f0f41b4b3321f45a611"  # pragma: allowlist secret
 TDJSON_ARCHIVE_PATH = "/ubuntu/pool/universe/t/td/libtdjson1.8.38_1.8.38~git20241021.d321984+dfsg-4_amd64.deb"
 TDJSON_URL = f"https://{UBUNTU_ARCHIVE_HOST}{TDJSON_ARCHIVE_PATH}"
-TDJSON_SHA256 = "250f2f51b4fae813ab166a0c12b1845e1ac5752cc66d74e43bdcd3e185e6401b"
+TDJSON_SHA256 = "250f2f51b4fae813ab166a0c12b1845e1ac5752cc66d74e43bdcd3e185e6401b"  # pragma: allowlist secret
 
 
 def _secure_dir(path: Path) -> None:

@@ -148,6 +148,25 @@ def _add_posix_user_path(directory: Path) -> bool:
     return True
 
 
+def _source_package_version(source_dir: Path) -> str:
+    pyproject = source_dir / "pyproject.toml"
+    in_project = False
+    for raw_line in pyproject.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line == "[project]":
+            in_project = True
+            continue
+        if in_project and line.startswith("["):
+            break
+        if in_project:
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "version":
+                version = value.strip().strip('"').strip("'")
+                if version:
+                    return version
+    raise RuntimeError("Could not read the package version from pyproject.toml.")
+
+
 def _install_launcher(venv: Path, bin_home: Path) -> bool:
     if bin_home.is_symlink():
         raise RuntimeError("Refusing to install into a symlinked command directory.")
@@ -174,6 +193,7 @@ def _install_launcher(venv: Path, bin_home: Path) -> bool:
 def main() -> int:
     source_dir = Path(__file__).resolve().parent
     source_package = (source_dir / "src" / "bulkuploader").resolve()
+    expected_version = _source_package_version(source_dir)
     root = app_data_root()
     runtime = root / "runtime"
     venv_dir = runtime / "venv"
@@ -192,8 +212,15 @@ def main() -> int:
             pass
 
     print(f"Installing {PUBLIC_NAME} for {sys.platform}...")
-    venv.EnvBuilder(with_pip=True).create(venv_dir)
     python = venv_python(venv_dir)
+    # Upgrades must reuse a healthy existing runtime. Re-running EnvBuilder.create()
+    # over a POSIX venv whose python executable is already a symlink to the system
+    # interpreter can raise shutil.SameFileError before pip gets a chance to upgrade
+    # the package. The runtime venv contains application code/dependencies only;
+    # user configuration, Telegram sessions, and job history live outside runtime/.
+    if not python.is_file():
+        venv.EnvBuilder(with_pip=True).create(venv_dir)
+        python = venv_python(venv_dir)
     if not python.is_file():
         raise RuntimeError("Virtual-environment Python is missing or invalid.")
 
@@ -218,10 +245,26 @@ def main() -> int:
     if installed_from.parent == source_package:
         raise RuntimeError("Install verification failed: telegram still points at the source package.")
 
+    version_probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import importlib.metadata as m; print(m.version('telegram-uploader'))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    installed_version = version_probe.stdout.strip()
+    if installed_version != expected_version:
+        raise RuntimeError("Install verification failed: installed package version does not match the source package version.")
+
     path_changed = _install_launcher(venv_dir, bin_home)
 
     print()
     print("Installed command: telegram")
+    print(f"Installed version: {installed_version}")
     print("Installed package verified.")
     print("Application data directory prepared.")
     print("The source/repository folder is no longer required for daily use.")

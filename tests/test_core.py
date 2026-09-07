@@ -662,6 +662,718 @@ def test_telegram_job_uses_multi_file_windows(tmp_path: Path):
     assert counters.bytes_sent == sum(record.size for record in records)
 
 
+def test_telegram_retry_backoff_runs_once_per_round_not_per_batch(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+    from bulkuploader.app import TelegramDirect, _upload_job_telegram
+
+    db = StateDB(tmp_path / "state.sqlite3")
+    paths = []
+    for index in range(7):
+        path = tmp_path / f"retry-{index}.bin"
+        path.write_bytes(f"payload-{index}".encode())
+        paths.append(path)
+    records = scan_paths(paths, db)
+    destination = Destination("telegram", "peer:100", "Retry Test")
+
+    class RetryTelegram(TelegramDirect):
+        def __init__(self):
+            super().__init__()
+            self._file_window = 3
+            self.calls = {}
+            self.batch_sizes = []
+
+        def upload_batch(self, destination, batch_paths, on_bytes=None):
+            self.batch_sizes.append(len(batch_paths))
+            results = []
+            for path in batch_paths:
+                count = self.calls.get(path.name, 0)
+                self.calls[path.name] = count + 1
+                if count == 0:
+                    results.append(RuntimeError("temporary failure"))
+                else:
+                    if on_bytes:
+                        on_bytes(path.stat().st_size)
+                    results.append("ok")
+            return results
+
+    sleeps = []
+    monkeypatch.setattr(app.time, "sleep", sleeps.append)
+
+    tg = RetryTelegram()
+    counters = _upload_job_telegram(tg, destination, records, db, display=False)
+
+    assert tg.batch_sizes == [3, 3, 1, 3, 3, 1]
+    assert sleeps == [2]
+    assert counters.completed == 7
+    assert counters.failed == 0
+    assert counters.retrying == 0
+    assert counters.last_error == ""
+
+
+def test_telegram_rate_limit_pauses_whole_job_without_marking_every_file_failed(tmp_path: Path):
+    import bulkuploader.app as app
+    from bulkuploader.app import TelegramDirect
+
+    db = StateDB(tmp_path / "state.sqlite3")
+    records = []
+    for index in range(5):
+        path = tmp_path / f"limited-{index}.bin"
+        path.write_bytes(f"payload-{index}".encode())
+        records.extend(scan_paths([path], db))
+    destination = Destination("telegram", "peer:101", "Rate Limited")
+
+    class LimitedTelegram(TelegramDirect):
+        def __init__(self):
+            super().__init__()
+            self._file_window = 2
+            self.batch_sizes = []
+
+        def upload_batch(self, destination, batch_paths, on_bytes=None):
+            self.batch_sizes.append(len(batch_paths))
+            return [RuntimeError("TDLib send failed: Too Many Requests: retry after 1107") for _ in batch_paths]
+
+    counters = app.Counters()
+    tg = LimitedTelegram()
+    with pytest.raises(app.TelegramRateLimitError) as raised:
+        app._upload_job_telegram(tg, destination, records, db, display=False, counters=counters)
+
+    assert raised.value.retry_after == 1107
+    assert tg.batch_sizes == [2]
+    assert counters.failed == 0
+    assert counters.retrying == 5
+    jobs = db.unfinished_jobs("telegram")
+    assert len(jobs) == 1
+    unresolved = db.unresolved_job_rows(int(jobs[0]["id"]))
+    assert len(unresolved) == 5
+    assert all(row["status"] == "pending" for row in unresolved)
+
+
+def test_public_channel_resolver_accepts_public_broadcast_and_rejects_non_public():
+    from bulkuploader.app import TelegramDirect
+    from telethon.tl.types import Channel, ChatPhotoEmpty
+
+    public = Channel(91, "Public", ChatPhotoEmpty(), None, broadcast=True, username="publicchannel")
+    private = Channel(92, "Private", ChatPhotoEmpty(), None, broadcast=True)
+    group = Channel(93, "Group", ChatPhotoEmpty(), None, megagroup=True, username="publicgroup")
+
+    class Client:
+        def __init__(self, entity):
+            self.entity = entity
+
+        def get_entity(self, username):
+            return self.entity
+
+    tg = TelegramDirect()
+    tg.client = Client(public)
+    destination = tg.resolve_public_channel("@publicchannel")
+    assert destination.title == "Public"
+    assert destination.key in tg._entities
+
+    tg.client = Client(private)
+    with pytest.raises(RuntimeError, match="Only public Telegram broadcast channels"):
+        tg.resolve_public_channel("@publicchannel")
+
+    tg.client = Client(group)
+    with pytest.raises(RuntimeError, match="Only public Telegram broadcast channels"):
+        tg.resolve_public_channel("@publicchannel")
+
+
+def test_public_channel_input_and_download_filename_are_safe():
+    import bulkuploader.app as app
+
+    assert app._normalize_public_channel_input("@Example_Channel") == "Example_Channel"
+    assert app._normalize_public_channel_input("https://t.me/Example_Channel/123") == "Example_Channel"
+    with pytest.raises(RuntimeError, match="Private/invite-only"):
+        app._normalize_public_channel_input("https://t.me/+privateInvite")
+
+    class FileInfo:
+        name = "../../unsafe\\name?.jpg"
+        ext = ".jpg"
+
+    class Message:
+        id = 42
+        file = FileInfo()
+
+    filename = app._download_message_filename(Message())
+    assert filename.startswith("42_")
+    assert "/" not in filename
+    assert "\\" not in filename
+    assert "?" not in filename
+
+
+def test_public_channel_download_skips_completed_messages_on_rerun(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class FileInfo:
+        def __init__(self, name, size):
+            self.name = name
+            self.ext = Path(name).suffix
+            self.size = size
+
+    class Message:
+        def __init__(self, message_id, name, payload):
+            self.id = message_id
+            self.media = object()
+            self.file = FileInfo(name, len(payload))
+            self.payload = payload
+
+    messages = [
+        Message(1, "one.jpg", b"one"),
+        Message(2, "two.mp4", b"two-two"),
+    ]
+
+    class Client:
+        def __init__(self):
+            self.download_calls = []
+
+        def iter_messages(self, entity, reverse=False):
+            assert reverse is True
+            return iter(messages)
+
+        def download_media(self, message, file, progress_callback=None):
+            self.download_calls.append(message.id)
+            path = Path(file)
+            path.write_bytes(message.payload)
+            if progress_callback:
+                progress_callback(len(message.payload), len(message.payload))
+            return str(path)
+
+    client = Client()
+
+    class Adapter:
+        def __init__(self):
+            self.client = client
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            assert value == "@publicchannel"
+            return Destination("telegram", "peer:777", "Public Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    db = StateDB(tmp_path / "state.sqlite3")
+    output = tmp_path / "downloads"
+
+    first = app._download_public_channel_run("@publicchannel", output, db=db, display=False)
+    assert first.downloaded == 2
+    assert first.duplicates == 0
+    assert client.download_calls == [1, 2]
+
+    second = app._download_public_channel_run("@publicchannel", output, db=db, display=False)
+    assert second.downloaded == 0
+    assert second.duplicates == 2
+    assert client.download_calls == [1, 2]
+
+
+def test_public_channel_download_skips_same_media_reused_in_another_message(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class Document:
+        id = 555
+
+    class FileInfo:
+        name = "same.jpg"
+        ext = ".jpg"
+        size = 4
+
+    class Message:
+        def __init__(self, message_id):
+            self.id = message_id
+            self.media = object()
+            self.document = Document()
+            self.file = FileInfo()
+            self.payload = b"same"
+
+    messages = [Message(10), Message(11)]
+
+    class Client:
+        def __init__(self):
+            self.download_calls = []
+
+        def iter_messages(self, entity, reverse=False):
+            return iter(messages)
+
+        def download_media(self, message, file, progress_callback=None):
+            self.download_calls.append(message.id)
+            path = Path(file)
+            path.write_bytes(message.payload)
+            if progress_callback:
+                progress_callback(len(message.payload), len(message.payload))
+            return str(path)
+
+    client = Client()
+
+    class Adapter:
+        def __init__(self):
+            self.client = client
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:778", "Public Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    db = StateDB(tmp_path / "state.sqlite3")
+    output = tmp_path / "downloads"
+    counters = app._download_public_channel_run("@publicchannel", output, db=db, display=False)
+
+    assert counters.downloaded == 1
+    assert counters.duplicates == 1
+    assert client.download_calls == [10]
+    assert len([path for path in output.iterdir() if path.is_file()]) == 1
+
+
+def test_public_channel_download_removes_same_content_with_different_media_ids(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class Document:
+        def __init__(self, document_id):
+            self.id = document_id
+
+    class FileInfo:
+        def __init__(self, name):
+            self.name = name
+            self.ext = Path(name).suffix
+            self.size = 7
+
+    class Message:
+        def __init__(self, message_id, document_id, name):
+            self.id = message_id
+            self.media = object()
+            self.document = Document(document_id)
+            self.file = FileInfo(name)
+            self.payload = b"same123"
+
+    messages = [
+        Message(20, 1001, "first.jpg"),
+        Message(21, 1002, "second.jpg"),
+    ]
+
+    class Client:
+        def __init__(self):
+            self.download_calls = []
+
+        def iter_messages(self, entity, reverse=False):
+            return iter(messages)
+
+        def download_media(self, message, file, progress_callback=None):
+            self.download_calls.append(message.id)
+            path = Path(file)
+            path.write_bytes(message.payload)
+            if progress_callback:
+                progress_callback(len(message.payload), len(message.payload))
+            return str(path)
+
+    client = Client()
+
+    class Adapter:
+        def __init__(self):
+            self.client = client
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:779", "Public Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    db = StateDB(tmp_path / "state.sqlite3")
+    output = tmp_path / "downloads"
+    counters = app._download_public_channel_run("@publicchannel", output, db=db, display=False)
+
+    assert counters.downloaded == 1
+    assert counters.duplicates == 1
+    assert client.download_calls == [20, 21]
+    assert len([path for path in output.iterdir() if path.is_file()]) == 1
+
+
+def test_public_channel_download_preserves_unrelated_existing_same_size_file(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class Document:
+        id = 3030
+
+    class FileInfo:
+        name = "file.jpg"
+        ext = ".jpg"
+        size = 4
+
+    class Message:
+        id = 30
+        media = object()
+        document = Document()
+        file = FileInfo()
+        payload = b"good"
+
+    class Client:
+        def __init__(self):
+            self.download_calls = []
+
+        def iter_messages(self, entity, reverse=False):
+            return iter([Message()])
+
+        def download_media(self, message, file, progress_callback=None):
+            self.download_calls.append(message.id)
+            path = Path(file)
+            path.write_bytes(message.payload)
+            if progress_callback:
+                progress_callback(len(message.payload), len(message.payload))
+            return str(path)
+
+    client = Client()
+
+    class Adapter:
+        def __init__(self):
+            self.client = client
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:780", "Public Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    db = StateDB(tmp_path / "state.sqlite3")
+    output = tmp_path / "downloads"
+    output.mkdir()
+    existing = output / "30_file.jpg"
+    existing.write_bytes(b"bad!")
+
+    counters = app._download_public_channel_run("@publicchannel", output, db=db, display=False)
+
+    assert counters.downloaded == 1
+    assert counters.duplicates == 0
+    assert client.download_calls == [30]
+    assert existing.read_bytes() == b"bad!"
+    assert (output / "30_file-1.jpg").read_bytes() == b"good"
+
+
+def test_default_download_job_stores_token_not_absolute_home_path(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    home = tmp_path / "trusted-home"
+    home.mkdir()
+
+    class FileInfo:
+        name = "one.jpg"
+        ext = ".jpg"
+        mime_type = "image/jpeg"
+        size = 3
+
+    class Message:
+        id = 1
+        media = object()
+        file = FileInfo()
+        payload = b"one"
+
+    class Client:
+        def iter_messages(self, entity, reverse=False):
+            return iter([Message()])
+
+        def download_media(self, message, file, progress_callback=None):
+            target = Path(file)
+            target.write_bytes(message.payload)
+            if progress_callback:
+                progress_callback(len(message.payload), len(message.payload))
+            return str(target)
+
+    class Adapter:
+        def __init__(self):
+            self.client = Client()
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:781", "Public Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    monkeypatch.setattr(app, "trusted_home", lambda: home)
+    monkeypatch.setattr(app.console, "input", lambda prompt="": "")
+    db = StateDB(tmp_path / "state.sqlite3")
+
+    counters = app._download_public_channel_run("@publicchannel", None, db=db, display=False)
+    assert counters.downloaded == 1
+    row = db.conn.execute("SELECT output_ref,status FROM download_jobs").fetchone()
+    assert row["output_ref"] == "default"
+    assert str(home) not in row["output_ref"]
+    assert row["status"] == "done"
+    assert (home / "Downloads" / "TG Uploader" / "Public Channel").is_dir()
+
+
+def test_download_job_schema_migrates_existing_rows_to_all_filter(tmp_path: Path):
+    db_path = tmp_path / "state.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE download_jobs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "created_at INTEGER NOT NULL,"
+        "platform TEXT NOT NULL,"
+        "source_key TEXT NOT NULL,"
+        "source_title TEXT NOT NULL,"
+        "source_input TEXT NOT NULL,"
+        "output_ref TEXT NOT NULL,"
+        "status TEXT NOT NULL DEFAULT 'active'"
+        ")"
+    )
+    conn.execute(
+        "INSERT INTO download_jobs(created_at,platform,source_key,source_title,source_input,output_ref,status) "
+        "VALUES(1,'telegram','peer:1','Old Channel','@old','default','active')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = StateDB(db_path)
+    row = db.conn.execute("SELECT media_filter FROM download_jobs WHERE id=1").fetchone()
+    assert row["media_filter"] == "all"
+
+
+def test_public_channel_download_filter_only_downloads_selected_media(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class FileInfo:
+        def __init__(self, name, mime_type, payload):
+            self.name = name
+            self.ext = Path(name).suffix
+            self.mime_type = mime_type
+            self.size = len(payload)
+
+    class Message:
+        def __init__(self, message_id, name, mime_type, payload):
+            self.id = message_id
+            self.media = object()
+            self.file = FileInfo(name, mime_type, payload)
+            self.payload = payload
+            self.photo = None
+
+    messages = [
+        Message(1, "clip.mp4", "video/mp4", b"video"),
+        Message(2, "photo.jpg", "image/jpeg", b"image"),
+        Message(3, "track.mp3", "audio/mpeg", b"audio"),
+        Message(4, "notes.pdf", "application/pdf", b"document"),
+    ]
+
+    class Client:
+        def __init__(self):
+            self.download_calls = []
+
+        def iter_messages(self, entity, reverse=False):
+            return iter(messages)
+
+        def download_media(self, message, file, progress_callback=None):
+            self.download_calls.append(message.id)
+            target = Path(file)
+            target.write_bytes(message.payload)
+            if progress_callback:
+                progress_callback(len(message.payload), len(message.payload))
+            return str(target)
+
+    client = Client()
+
+    class Adapter:
+        def __init__(self):
+            self.client = client
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:782", "Public Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    db = StateDB(tmp_path / "state.sqlite3")
+    output = tmp_path / "videos"
+
+    counters = app._download_public_channel_run(
+        "@publicchannel",
+        output,
+        media_filter="videos",
+        db=db,
+        display=False,
+    )
+
+    assert client.download_calls == [1]
+    assert counters.total_files == 1
+    assert counters.downloaded == 1
+    row = db.conn.execute("SELECT media_filter FROM download_jobs").fetchone()
+    assert row["media_filter"] == "videos"
+
+
+def test_public_channel_download_uses_bounded_concurrent_file_window(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class FileInfo:
+        def __init__(self, index):
+            self.name = f"file-{index}.bin"
+            self.ext = ".bin"
+            self.mime_type = "application/octet-stream"
+            self.size = 8
+
+    class Message:
+        def __init__(self, index):
+            self.id = index
+            self.media = object()
+            self.file = FileInfo(index)
+            self.photo = None
+            self.payload = f"{index:08d}".encode()
+
+    messages = [Message(index) for index in range(1, 9)]
+
+    class Client:
+        def __init__(self):
+            self.loop = asyncio.new_event_loop()
+            self.active = 0
+            self.max_active = 0
+
+        def iter_messages(self, entity, reverse=False):
+            return iter(messages)
+
+        async def download_media(self, message, file, progress_callback=None):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.01)
+                target = Path(file)
+                target.write_bytes(message.payload)
+                if progress_callback:
+                    progress_callback(len(message.payload), len(message.payload))
+                return str(target)
+            finally:
+                self.active -= 1
+
+    client = Client()
+
+    class Adapter:
+        def __init__(self):
+            self.client = client
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:783", "Concurrent Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    db = StateDB(tmp_path / "state.sqlite3")
+    output = tmp_path / "downloads"
+    try:
+        counters = app._download_public_channel_run(
+            "@publicchannel",
+            output,
+            db=db,
+            display=False,
+        )
+    finally:
+        client.loop.close()
+
+    assert counters.downloaded == 8
+    assert client.max_active == app.TELEGRAM_DOWNLOAD_FILE_WINDOW
+
+
+def test_download_menu_back_cancels_before_creating_job(tmp_path: Path, monkeypatch):
+    import bulkuploader.app as app
+
+    class FileInfo:
+        name = "one.jpg"
+        ext = ".jpg"
+        mime_type = "image/jpeg"
+        size = 3
+
+    class Message:
+        id = 1
+        media = object()
+        file = FileInfo()
+        photo = None
+
+    class Client:
+        def iter_messages(self, entity, reverse=False):
+            return iter([Message()])
+
+    class Adapter:
+        def __init__(self):
+            self.client = Client()
+
+        def connect(self):
+            return self
+
+        def resolve_public_channel(self, value):
+            return Destination("telegram", "peer:784", "Cancel Channel")
+
+        def _entity_for(self, destination):
+            return object()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app, "TelegramDirect", Adapter)
+    monkeypatch.setattr(app.console, "input", lambda prompt="": "b")
+    db = StateDB(tmp_path / "state.sqlite3")
+
+    counters = app._download_public_channel_run(
+        "@publicchannel",
+        media_filter=None,
+        db=db,
+        display=False,
+    )
+
+    assert counters.cancelled is True
+    assert db.unfinished_download_jobs() == []
+
+
+def test_download_command_argument_parsing():
+    import bulkuploader.app as app
+
+    assert app._argv_download(["download"]) == ("download", None)
+    assert app._argv_download(["download", "@example"]) == ("download", "@example")
+    assert app._argv_download(["download", "https://t.me/example"]) == ("download", "https://t.me/example")
+    assert app._argv_download(["download", "resume"]) == ("resume", None)
+    assert app._argv_download(["doctor"]) is None
+
+
 def test_native_tdlib_argument_parsing():
     assert _argv_native(["native"]) == ("doctor", None)
     assert _argv_native(["native", "status"]) == ("doctor", None)
@@ -1130,3 +1842,22 @@ def test_ask_text_uses_full_editor_on_tty(monkeypatch):
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setattr(app, "_terminal_text_editor", lambda title: "first line\nsecond line")
     assert app.ask_text("Saved Messages") == "first line\nsecond line"
+
+
+def test_release_version_constants_stay_in_sync():
+    from bulkuploader import __version__
+    from bulkuploader.tdlib_native import APP_VERSION
+
+    assert __version__ == APP_VERSION
+
+
+def test_cli_version_command_reports_installed_package_version(monkeypatch, capsys):
+    import bulkuploader.app as app
+
+    monkeypatch.setattr(app, "package_version", lambda: "1.0.2")
+    monkeypatch.setattr(app.sys, "argv", ["telegram", "--version"])
+    with pytest.raises(SystemExit) as raised:
+        app.telegram_entry()
+
+    assert raised.value.code == 0
+    assert capsys.readouterr().out.strip() == "1.0.2"

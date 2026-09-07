@@ -4,16 +4,19 @@ import asyncio
 import getpass
 import hashlib
 import contextlib
+import inspect
+import importlib.metadata
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -23,7 +26,7 @@ except ImportError:
     def blake3():
         return hashlib.blake2b(digest_size=32)
 
-from bulkuploader.paths import app_data_dir
+from bulkuploader.paths import app_data_dir, trusted_home
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -42,11 +45,19 @@ TELEGRAM_DEFAULT_PART_WORKERS = 16
 TELEGRAM_SINGLE_MIN_PART_WORKERS = 2
 TELEGRAM_SINGLE_MAX_PART_WORKERS = 10
 TELEGRAM_SINGLE_DEFAULT_PART_WORKERS = 5
+TELEGRAM_DOWNLOAD_FILE_WINDOW = 4
 TELEGRAM_DEFAULT_FILE_WINDOW = 8
 TELEGRAM_DEFAULT_TRANSFER_CONNECTIONS = 8
 TELEGRAM_MAX_TRANSFER_CONNECTIONS = 8
 TRANSIENT_FILE_SUFFIXES = (".part", ".crdownload", ".download", ".partial", ".aria2", ".!qb")
 console = Console()
+
+
+def package_version() -> str:
+    try:
+        return importlib.metadata.version(APP_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return "development"
 
 
 def _is_transient_file(path: Path) -> bool:
@@ -231,8 +242,41 @@ class StateDB:
                     PRIMARY KEY(job_id, digest),
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
+                CREATE TABLE IF NOT EXISTS downloads (
+                    platform TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    media_key TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    downloaded_at INTEGER NOT NULL,
+                    PRIMARY KEY(platform, source_key, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS downloads_media_idx
+                    ON downloads(platform, source_key, media_key);
+                CREATE INDEX IF NOT EXISTS downloads_digest_idx
+                    ON downloads(platform, source_key, digest);
+                CREATE TABLE IF NOT EXISTS download_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    source_title TEXT NOT NULL,
+                    source_input TEXT NOT NULL,
+                    output_ref TEXT NOT NULL,
+                    media_filter TEXT NOT NULL DEFAULT 'all',
+                    status TEXT NOT NULL DEFAULT 'active'
+                );
                 """
             )
+            download_job_columns = {
+                str(row[1]) for row in self.conn.execute("PRAGMA table_info(download_jobs)")
+            }
+            if "media_filter" not in download_job_columns:
+                self.conn.execute(
+                    "ALTER TABLE download_jobs ADD COLUMN media_filter TEXT NOT NULL DEFAULT 'all'"
+                )
 
     def cached_digest(self, stat: os.stat_result) -> str | None:
         with self._lock:
@@ -325,6 +369,87 @@ class StateDB:
                 continue
             out.append(FileRecord(path, st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino, row["digest"]))
         return out
+
+    def downloaded_message(self, platform: str, source_key: str, message_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT media_key,digest,path,size,downloaded_at FROM downloads WHERE platform=? AND source_key=? AND message_id=?",
+                (platform, source_key, int(message_id)),
+            ).fetchone()
+
+    def downloaded_media(self, platform: str, source_key: str, media_key: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT message_id,digest,path,size,downloaded_at FROM downloads WHERE platform=? AND source_key=? AND media_key=?",
+                (platform, source_key, media_key),
+            ).fetchone()
+
+    def downloaded_digest(self, platform: str, source_key: str, digest: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT message_id,media_key,path,size,downloaded_at FROM downloads WHERE platform=? AND source_key=? AND digest=? LIMIT 1",
+                (platform, source_key, digest),
+            ).fetchone()
+
+    def mark_downloaded(
+        self,
+        platform: str,
+        source_key: str,
+        message_id: int,
+        media_key: str,
+        digest: str,
+        path: Path,
+        size: int,
+    ) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO downloads(platform,source_key,message_id,media_key,digest,path,size,downloaded_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    platform,
+                    source_key,
+                    int(message_id),
+                    media_key,
+                    digest,
+                    str(path),
+                    int(size),
+                    int(time.time()),
+                ),
+            )
+
+    def create_download_job(
+        self,
+        source_key: str,
+        source_title: str,
+        source_input: str,
+        output_ref: str,
+        media_filter: str,
+    ) -> int:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO download_jobs(created_at,platform,source_key,source_title,source_input,output_ref,media_filter,status) "
+                "VALUES(?,?,?,?,?,?,?,'active')",
+                (
+                    int(time.time()),
+                    "telegram",
+                    source_key,
+                    source_title,
+                    source_input,
+                    output_ref,
+                    media_filter,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def finish_download_job(self, job_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("UPDATE download_jobs SET status='done' WHERE id=?", (int(job_id),))
+
+    def unfinished_download_jobs(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.conn.execute(
+                "SELECT * FROM download_jobs WHERE status='active' ORDER BY id DESC"
+            ))
 
 
 def hash_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
@@ -562,6 +687,20 @@ def _configure_telegram_api_interactive() -> tuple[int, str]:
             "[dim]This run can continue, but a future run will ask for the API hash again.[/]"
         )
     return api_id, api_hash
+
+
+def _normalize_public_channel_input(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        raise RuntimeError("Enter a public Telegram channel username or t.me link.")
+    raw = re.sub(r"^https?://(?:www\.)?(?:t\.me|telegram\.me)/", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"^(?:t\.me|telegram\.me)/", "", raw, flags=re.IGNORECASE)
+    username = raw.split("/", 1)[0].lstrip("@").strip()
+    if username.startswith("+") or username.lower() == "joinchat":
+        raise RuntimeError("Private/invite-only Telegram links are not supported. Use a public channel username or link.")
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,64}", username):
+        raise RuntimeError("Invalid public Telegram channel username or link.")
+    return username
 
 
 class TelegramDirect:
@@ -940,6 +1079,26 @@ class TelegramDirect:
         peer_id = utils.get_peer_id(entity)
         key = f"peer:{peer_id}"
         title = utils.get_display_name(entity).strip() or username
+        self._entities[key] = entity
+        return Destination(self.name, key, title)
+
+    def resolve_public_channel(self, value: str) -> Destination:
+        if self.client is None:
+            raise RuntimeError("Telegram client is not connected.")
+        username = _normalize_public_channel_input(value)
+        try:
+            entity = self.client.get_entity("@" + username)
+        except Exception as exc:
+            raise RuntimeError(f"Public Telegram channel was not found or is not accessible: @{username}") from exc
+
+        from telethon import utils
+        from telethon.tl.types import Channel
+
+        if not isinstance(entity, Channel) or not getattr(entity, "broadcast", False) or not getattr(entity, "username", None):
+            raise RuntimeError("Only public Telegram broadcast channels are supported for downloads.")
+        peer_id = utils.get_peer_id(entity)
+        key = f"peer:{peer_id}"
+        title = utils.get_display_name(entity).strip() or ("@" + username)
         self._entities[key] = entity
         return Destination(self.name, key, title)
 
@@ -1606,6 +1765,604 @@ def ask_files(db: StateDB) -> list[FileRecord]:
     return scan_paths(paths, db)
 
 
+class TelegramRateLimitError(RuntimeError):
+    def __init__(self, retry_after: int, resume_command: str = "telegram resume"):
+        self.retry_after = max(1, int(retry_after))
+        self.resume_command = resume_command
+        minutes, seconds = divmod(self.retry_after, 60)
+        human = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        super().__init__(
+            f"Telegram rate limit is active. Wait about {human}, then run `{resume_command}`. "
+            "The unfinished work has been preserved and no additional requests will be sent during the cooldown."
+        )
+
+
+def _telegram_retry_after_seconds(exc: BaseException) -> int | None:
+    text = str(exc)
+    match = re.search(r"retry\s+after\s+(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _safe_download_component(value: str, fallback: str = "media") -> str:
+    cleaned = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", str(value)).strip(" .")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        cleaned = fallback
+    stem = cleaned.split(".", 1)[0].upper()
+    if stem in WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    return cleaned[:160]
+
+
+def _download_message_filename(message) -> str:
+    message_id = int(getattr(message, "id", 0) or 0)
+    file_info = getattr(message, "file", None)
+    name = getattr(file_info, "name", None) if file_info is not None else None
+    ext = str(getattr(file_info, "ext", "") or "") if file_info is not None else ""
+    if name:
+        base = _safe_download_component(str(name), fallback=f"media{ext}")
+    else:
+        base = _safe_download_component(f"media{ext}", fallback="media")
+    return f"{message_id}_{base}"
+
+
+def _available_download_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(1, 10000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not choose a non-conflicting download filename.")
+
+
+def _download_media_key(message) -> str:
+    document = getattr(message, "document", None)
+    if document is None:
+        document = getattr(getattr(message, "media", None), "document", None)
+    document_id = getattr(document, "id", None)
+    if document_id is not None:
+        return f"document:{int(document_id)}"
+
+    photo = getattr(message, "photo", None)
+    if photo is None:
+        photo = getattr(getattr(message, "media", None), "photo", None)
+    photo_id = getattr(photo, "id", None)
+    if photo_id is not None:
+        return f"photo:{int(photo_id)}"
+
+    file_info = getattr(message, "file", None)
+    file_id = getattr(file_info, "id", None) if file_info is not None else None
+    if file_id is not None:
+        return f"file:{int(file_id)}"
+    return f"message:{int(getattr(message, 'id', 0) or 0)}"
+
+
+DOWNLOAD_FILTER_LABELS = {
+    "all": "All media/files",
+    "videos": "Videos",
+    "images": "Images",
+    "documents": "Documents",
+    "audio": "Audio",
+}
+
+
+@dataclass
+class DownloadCandidate:
+    message: object
+    message_id: int
+    media_key: str
+    category: str
+    size: int
+    aliases: list[int] = field(default_factory=list)
+
+
+def _download_media_category(message) -> str:
+    if getattr(message, "photo", None) is not None:
+        return "images"
+    file_info = getattr(message, "file", None)
+    mime_type = str(getattr(file_info, "mime_type", "") or "").lower()
+    if mime_type.startswith("video/"):
+        return "videos"
+    if mime_type.startswith("image/"):
+        return "images"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    return "documents"
+
+
+def _scan_download_candidates(adapter: TelegramDirect, entity) -> tuple[int, list[DownloadCandidate]]:
+    message_count = 0
+    unique: dict[str, DownloadCandidate] = {}
+    for message in adapter.client.iter_messages(entity, reverse=True):
+        message_count += 1
+        file_info = getattr(message, "file", None)
+        if getattr(message, "media", None) is None or file_info is None:
+            continue
+        message_id = int(message.id)
+        media_key = _download_media_key(message)
+        size = max(0, int(getattr(file_info, "size", 0) or 0))
+        existing = unique.get(media_key)
+        if existing is not None:
+            existing.aliases.append(message_id)
+            continue
+        unique[media_key] = DownloadCandidate(
+            message=message,
+            message_id=message_id,
+            media_key=media_key,
+            category=_download_media_category(message),
+            size=size,
+        )
+    return message_count, list(unique.values())
+
+
+def _choose_download_filter(source_title: str, message_count: int, candidates: list[DownloadCandidate]) -> str | None:
+    total_media = sum(1 + len(item.aliases) for item in candidates)
+    total_size = sum(item.size * (1 + len(item.aliases)) for item in candidates)
+    console.print(f"\nChannel: {source_title}")
+    console.print(f"Messages found: {message_count:,}")
+    console.print(f"Media files: {total_media:,}")
+    console.print(f"Total size: {human_bytes(total_size)}\n")
+    console.print("Download")
+    choices = ["all", "videos", "images", "documents", "audio"]
+    for index, key in enumerate(choices, 1):
+        count = sum((1 + len(item.aliases)) for item in candidates if key == "all" or item.category == key)
+        console.print(f"{index}. {DOWNLOAD_FILTER_LABELS[key]} ({count:,})")
+    console.print("B. Back")
+    while True:
+        raw = console.input("Choose [1/2/3/4/5/B]: ").strip().lower()
+        if raw == "b":
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
+        console.print("Choose 1, 2, 3, 4, 5, or B.")
+
+
+@dataclass
+class DownloadCounters:
+    scanned: int = 0
+    media: int = 0
+    total_files: int = 0
+    total_bytes: int = 0
+    downloaded: int = 0
+    duplicates: int = 0
+    failed: int = 0
+    bytes_received: int = 0
+    bytes_done: int = 0
+    active: int = 0
+    current: str = ""
+    last_error: str = ""
+    cancelled: bool = False
+    started: float = 0.0
+
+
+def render_download_status(source_title: str, c: DownloadCounters) -> Table:
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    elapsed = max(time.monotonic() - c.started, 0.001)
+    remaining = max(0, c.total_files - c.downloaded - c.duplicates)
+    table.add_row("Channel", source_title)
+    table.add_row("Files", f"{c.total_files:,}")
+    table.add_row("Downloaded", f"{c.downloaded:,}")
+    table.add_row("Remaining", f"{remaining:,}")
+    table.add_row("Duplicates", f"{c.duplicates:,}")
+    if c.failed:
+        table.add_row("Failed", f"{c.failed:,}")
+    table.add_row("Speed", human_bytes(c.bytes_received / elapsed) + "/s")
+    table.add_row("Size", f"{human_bytes(c.bytes_done)} / {human_bytes(c.total_bytes)}")
+    if c.active:
+        table.add_row("Active", f"{c.active:,}")
+    if c.current:
+        table.add_row("Current", c.current[:80])
+    if c.last_error:
+        message = c.last_error.replace("\n", " ").strip()
+        if len(message) > 120:
+            message = message[:117] + "..."
+        table.add_row("Last error", message)
+    return table
+
+
+def _default_download_dir(source_title: str) -> Path:
+    return trusted_home() / "Downloads" / "TG Uploader" / _safe_download_component(source_title, "Telegram Channel")
+
+
+def _prepare_download_dir(path: Path) -> Path:
+    raw = str(path)
+    if raw == "~":
+        path = trusted_home()
+    elif raw.startswith("~/") or raw.startswith("~\\"):
+        path = trusted_home() / raw[2:]
+    elif not path.is_absolute():
+        path = trusted_home() / path
+    target = path.resolve(strict=False)
+    target.mkdir(parents=True, exist_ok=True)
+    if not target.is_dir():
+        raise RuntimeError("Download destination is not a directory.")
+    _secure_dir(target)
+    return target
+
+
+def _download_public_channel_run(
+    source_input: str,
+    output_dir: Path | None = None,
+    *,
+    output_ref: str | None = None,
+    media_filter: str | None = "all",
+    db: StateDB | None = None,
+    job_id: int | None = None,
+    display: bool = True,
+) -> DownloadCounters:
+    db = db or StateDB()
+    adapter = TelegramDirect().connect()
+    completed_scan = False
+    live_ctx: Live | None = None
+    c = DownloadCounters(started=time.monotonic())
+    try:
+        source = adapter.resolve_public_channel(source_input)
+        entity = adapter._entity_for(source)
+        message_count, candidates = _scan_download_candidates(adapter, entity)
+        c.scanned = message_count
+
+        if media_filter is None:
+            media_filter = _choose_download_filter(source.title, message_count, candidates)
+            if media_filter is None:
+                c.cancelled = True
+                return c
+        if media_filter not in DOWNLOAD_FILTER_LABELS:
+            raise RuntimeError("Saved download filter is invalid. Start a new channel download.")
+
+        selected = [
+            item for item in candidates
+            if media_filter == "all" or item.category == media_filter
+        ]
+        c.media = sum(1 + len(item.aliases) for item in candidates)
+        c.total_files = sum(1 + len(item.aliases) for item in selected)
+        c.total_bytes = sum(item.size * (1 + len(item.aliases)) for item in selected)
+        if not selected:
+            console.print(f"No {DOWNLOAD_FILTER_LABELS[media_filter].lower()} found in this channel.")
+            return c
+
+        if output_dir is None:
+            default_dir = _default_download_dir(source.title)
+            if output_ref is not None:
+                output_dir = default_dir if output_ref == "default" else Path(output_ref)
+            else:
+                raw = console.input("Download folder [press Enter for default]: ").strip()
+                if raw:
+                    output_ref = raw
+                    output_dir = Path(raw)
+                else:
+                    output_ref = "default"
+                    output_dir = default_dir
+        elif output_ref is None:
+            output_ref = str(output_dir)
+        output_dir = _prepare_download_dir(output_dir)
+        if job_id is None:
+            job_id = db.create_download_job(
+                source.key,
+                source.title,
+                source_input,
+                output_ref or "default",
+                media_filter,
+            )
+
+        c.started = time.monotonic()
+        live_ctx = Live(render_download_status(source.title, c), console=console, refresh_per_second=4) if display else None
+        if live_ctx:
+            live_ctx.start()
+        last_refresh = 0.0
+
+        def refresh(force: bool = False) -> None:
+            nonlocal last_refresh
+            if not live_ctx:
+                return
+            now = time.monotonic()
+            if force or now - last_refresh >= 0.15:
+                live_ctx.update(render_download_status(source.title, c))
+                last_refresh = now
+
+        def valid_record(row, expected_size: int = 0) -> tuple[Path, int] | None:
+            if row is None:
+                return None
+            saved_path = Path(row["path"])
+            try:
+                saved_size = int(row["size"])
+                valid = saved_path.is_file() and saved_path.stat().st_size == saved_size
+                if expected_size > 0:
+                    valid = valid and saved_size == expected_size
+            except OSError:
+                return None
+            return (saved_path, saved_size) if valid else None
+
+        def mark_aliases(item: DownloadCandidate, digest: str, saved_path: Path, size: int) -> None:
+            for alias_id in item.aliases:
+                db.mark_downloaded(
+                    "telegram",
+                    source.key,
+                    alias_id,
+                    item.media_key,
+                    digest,
+                    saved_path,
+                    size,
+                )
+
+        def count_handled(item: DownloadCandidate, size: int, *, downloaded: bool) -> None:
+            logical_count = 1 + len(item.aliases)
+            logical_size = (item.size or size) * logical_count
+            c.bytes_done += logical_size
+            if downloaded:
+                c.downloaded += 1
+                c.duplicates += len(item.aliases)
+            else:
+                c.duplicates += logical_count
+
+        def prepare(item: DownloadCandidate):
+            previous = db.downloaded_message("telegram", source.key, item.message_id)
+            valid_previous = valid_record(previous, item.size)
+            if valid_previous is not None:
+                saved_path, saved_size = valid_previous
+                digest = str(previous["digest"])
+                mark_aliases(item, digest, saved_path, saved_size)
+                count_handled(item, saved_size, downloaded=False)
+                return None
+
+            same_media = db.downloaded_media("telegram", source.key, item.media_key)
+            valid_media = valid_record(same_media, item.size)
+            if valid_media is not None:
+                saved_path, saved_size = valid_media
+                digest = str(same_media["digest"])
+                db.mark_downloaded(
+                    "telegram", source.key, item.message_id, item.media_key, digest, saved_path, saved_size
+                )
+                mark_aliases(item, digest, saved_path, saved_size)
+                count_handled(item, saved_size, downloaded=False)
+                return None
+
+            final_path = output_dir / _download_message_filename(item.message)
+            preexisting_path: Path | None = None
+            preexisting_digest: str | None = None
+            preexisting_size = 0
+            try:
+                if final_path.is_file():
+                    preexisting_path = final_path
+                    preexisting_size = final_path.stat().st_size
+                    preexisting_digest = hash_file(final_path)
+                    duplicate = db.downloaded_digest("telegram", source.key, preexisting_digest)
+                    valid_duplicate = valid_record(duplicate)
+                    if valid_duplicate is not None:
+                        saved_path, saved_size = valid_duplicate
+                        db.mark_downloaded(
+                            "telegram",
+                            source.key,
+                            item.message_id,
+                            item.media_key,
+                            preexisting_digest,
+                            saved_path,
+                            saved_size,
+                        )
+                        mark_aliases(item, preexisting_digest, saved_path, saved_size)
+                        count_handled(item, saved_size, downloaded=False)
+                        return None
+                    final_path = _available_download_path(final_path)
+            except OSError:
+                final_path = _available_download_path(final_path)
+
+            part_path = final_path.with_name(final_path.name + ".part")
+            with contextlib.suppress(OSError):
+                part_path.unlink()
+            return (item, final_path, part_path, preexisting_path, preexisting_digest, preexisting_size)
+
+        async def download_one(entry):
+            item, final_path, part_path, *_ = entry
+            progress_seen = 0
+            c.active += 1
+            c.current = final_path.name
+            refresh(True)
+
+            def progress(current: int, total: int) -> None:
+                nonlocal progress_seen
+                current_value = max(0, int(current or 0))
+                delta = max(0, current_value - progress_seen)
+                progress_seen = current_value
+                c.bytes_received += delta
+                refresh()
+
+            try:
+                result = adapter.client.download_media(
+                    item.message,
+                    file=str(part_path),
+                    progress_callback=progress,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            finally:
+                c.active = max(0, c.active - 1)
+                if c.active == 0:
+                    c.current = ""
+                refresh(True)
+
+        async def download_batch(entries):
+            return await asyncio.gather(
+                *(download_one(entry) for entry in entries),
+                return_exceptions=True,
+            )
+
+        loop = getattr(adapter.client, "loop", None)
+        own_loop = False
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            own_loop = True
+
+        try:
+            for offset in range(0, len(selected), TELEGRAM_DOWNLOAD_FILE_WINDOW):
+                batch_items = selected[offset : offset + TELEGRAM_DOWNLOAD_FILE_WINDOW]
+                prepared = []
+                for item in batch_items:
+                    entry = prepare(item)
+                    if entry is not None:
+                        prepared.append(entry)
+                refresh(True)
+                if not prepared:
+                    continue
+
+                results = loop.run_until_complete(download_batch(prepared))
+                rate_limit_seconds = 0
+                for entry, result in zip(prepared, results):
+                    item, final_path, part_path, preexisting_path, preexisting_digest, preexisting_size = entry
+                    if isinstance(result, BaseException):
+                        retry_after = getattr(result, "seconds", None) or _telegram_retry_after_seconds(result)
+                        if retry_after:
+                            rate_limit_seconds = max(rate_limit_seconds, int(retry_after))
+                        else:
+                            c.failed += 1
+                        c.last_error = str(result)
+                        with contextlib.suppress(OSError):
+                            part_path.unlink()
+                        continue
+
+                    try:
+                        candidate = Path(str(result)) if result else part_path
+                        if not part_path.exists() and candidate.exists() and candidate != part_path:
+                            os.replace(candidate, part_path)
+                        if not part_path.is_file():
+                            raise RuntimeError("Telegram download did not produce the expected temporary file.")
+                        size = part_path.stat().st_size
+                        if item.size > 0 and size != item.size:
+                            raise RuntimeError(
+                                f"Telegram download size mismatch: expected {item.size} bytes, received {size} bytes."
+                            )
+                        digest = hash_file(part_path)
+
+                        if (
+                            preexisting_path is not None
+                            and preexisting_digest == digest
+                            and preexisting_size == size
+                            and preexisting_path.is_file()
+                        ):
+                            with contextlib.suppress(OSError):
+                                part_path.unlink()
+                            db.mark_downloaded(
+                                "telegram", source.key, item.message_id, item.media_key, digest, preexisting_path, size
+                            )
+                            mark_aliases(item, digest, preexisting_path, size)
+                            count_handled(item, size, downloaded=False)
+                            c.last_error = ""
+                            continue
+
+                        duplicate = db.downloaded_digest("telegram", source.key, digest)
+                        valid_duplicate = valid_record(duplicate)
+                        if valid_duplicate is not None:
+                            duplicate_path, duplicate_size = valid_duplicate
+                            with contextlib.suppress(OSError):
+                                part_path.unlink()
+                            db.mark_downloaded(
+                                "telegram",
+                                source.key,
+                                item.message_id,
+                                item.media_key,
+                                digest,
+                                duplicate_path,
+                                duplicate_size,
+                            )
+                            mark_aliases(item, digest, duplicate_path, duplicate_size)
+                            count_handled(item, duplicate_size, downloaded=False)
+                            c.last_error = ""
+                            continue
+
+                        os.replace(part_path, final_path)
+                        db.mark_downloaded(
+                            "telegram", source.key, item.message_id, item.media_key, digest, final_path, size
+                        )
+                        mark_aliases(item, digest, final_path, size)
+                        count_handled(item, size, downloaded=True)
+                        c.last_error = ""
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        retry_after = getattr(exc, "seconds", None) or _telegram_retry_after_seconds(exc)
+                        if retry_after:
+                            rate_limit_seconds = max(rate_limit_seconds, int(retry_after))
+                        else:
+                            c.failed += 1
+                        c.last_error = str(exc)
+                        with contextlib.suppress(OSError):
+                            part_path.unlink()
+
+                refresh(True)
+                if rate_limit_seconds:
+                    raise TelegramRateLimitError(rate_limit_seconds, "telegram download resume")
+        finally:
+            if own_loop:
+                loop.close()
+
+        completed_scan = True
+        if c.failed == 0:
+            db.finish_download_job(job_id)
+        c.current = ""
+        refresh(True)
+        return c
+    finally:
+        if live_ctx:
+            live_ctx.stop()
+        adapter.close()
+        if completed_scan and c.failed:
+            console.print(f"[yellow]{c.failed} media file(s) failed and remain resumable with `telegram download resume`.[/]")
+
+
+def download_public_channel(source_input: str | None = None) -> int:
+    source_input = (source_input or console.input("Public channel username or t.me link: ")).strip()
+    counters = _download_public_channel_run(source_input, media_filter=None)
+    if counters.cancelled:
+        console.print("Download cancelled.")
+        return 0
+    console.print(
+        f"Download finished: {counters.downloaded:,} downloaded, "
+        f"{counters.duplicates:,} duplicate(s) skipped, {counters.failed:,} failed."
+    )
+    return 0 if counters.failed == 0 else 1
+
+
+def download_resume() -> int:
+    db = StateDB()
+    jobs = db.unfinished_download_jobs()
+    if not jobs:
+        console.print("No unfinished channel downloads.")
+        return 0
+    for i, row in enumerate(jobs, 1):
+        console.print(f"{i}. {row['source_title']}")
+    raw = console.input("Resume which download? ").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(jobs)):
+        return 1
+    row = jobs[int(raw) - 1]
+    counters = _download_public_channel_run(
+        str(row["source_input"]),
+        output_ref=str(row["output_ref"]),
+        media_filter=str(row["media_filter"]),
+        db=db,
+        job_id=int(row["id"]),
+    )
+    console.print(
+        f"Download resume finished: {counters.downloaded:,} downloaded, "
+        f"{counters.duplicates:,} duplicate(s) skipped, {counters.failed:,} failed."
+    )
+    return 0 if counters.failed == 0 else 1
+
+
 @dataclass
 class Counters:
     total: int = 0
@@ -1618,6 +2375,7 @@ class Counters:
     premium_waits: int = 0
     flood_waits: int = 0
     last_wait_seconds: int = 0
+    last_error: str = ""
     started: float = 0.0
 
 
@@ -1635,7 +2393,12 @@ def render_status(name: str, c: Counters) -> Table:
     if c.failed:
         table.add_row("Failed", f"{c.failed:,}")
     if c.retrying:
-        table.add_row("Retrying", f"{c.retrying:,}")
+        table.add_row("Retry queued", f"{c.retrying:,}")
+    if c.last_error:
+        message = c.last_error.replace("\n", " ").strip()
+        if len(message) > 120:
+            message = message[:117] + "..."
+        table.add_row("Last error", message)
     if c.premium_waits:
         table.add_row("Premium throttle", f"{c.premium_waits:,} wait(s), last {c.last_wait_seconds}s")
     elif c.flood_waits:
@@ -1698,42 +2461,80 @@ def _upload_job_telegram(adapter: TelegramDirect, destination: Destination, reco
 
     try:
         refresh(True)
-        while pending:
-            batch = pending[:adapter.file_window]
-            del pending[:adapter.file_window]
-            retry_attempts = [attempt for _, attempt in batch if attempt]
-            if retry_attempts:
-                c.retrying = len(retry_attempts) + sum(1 for _, attempt in pending if attempt)
+        current_round = [rec for rec, _ in pending]
+        for attempt in range(retries + 1):
+            if not current_round:
+                break
+
+            if attempt:
+                c.retrying = len(current_round)
                 refresh(True)
-                time.sleep(min(2 ** min(retry_attempts), 8))
+                # Back off once per retry round, not once per small file batch.
+                # Large jobs can contain thousands of files; sleeping before every
+                # 8-file batch made a healthy retry sweep appear frozen for minutes.
+                time.sleep(min(2 ** attempt, 8))
 
-            try:
-                results = adapter.upload_batch(destination, [rec.path for rec, _ in batch], on_bytes=on_bytes)
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                results = [exc] * len(batch)
+            next_round: list[FileRecord] = []
+            offset = 0
+            while offset < len(current_round):
+                batch = current_round[offset : offset + adapter.file_window]
+                offset += len(batch)
 
-            c.premium_waits = adapter._premium_waits
-            c.flood_waits = adapter._flood_waits
-            c.last_wait_seconds = adapter._last_wait_seconds
+                try:
+                    results = adapter.upload_batch(destination, [rec.path for rec in batch], on_bytes=on_bytes)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    results = [exc] * len(batch)
 
-            for (rec, attempt), result in zip(batch, results):
-                if isinstance(result, Exception):
-                    if attempt < retries:
-                        pending.append((rec, attempt + 1))
-                    else:
-                        c.failed += 1
-                        db.set_job_file(job_id, rec.digest, "failed", str(result))
-                    continue
+                c.premium_waits = adapter._premium_waits
+                c.flood_waits = adapter._flood_waits
+                c.last_wait_seconds = adapter._last_wait_seconds
 
-                db.mark_uploaded(destination.platform, destination.key, rec, result)
-                db.set_job_file(job_id, rec.digest, "done")
-                c.completed += 1
-                c.bytes_done += rec.size
+                rate_limit_seconds = 0
+                for rec, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        retry_after = getattr(result, "seconds", None) or _telegram_retry_after_seconds(result)
+                        if retry_after:
+                            rate_limit_seconds = max(rate_limit_seconds, retry_after)
+                            next_round.append(rec)
+                            db.set_job_file(job_id, rec.digest, "pending", str(result))
+                            c.last_error = str(result)
+                            continue
+                        if attempt < retries:
+                            next_round.append(rec)
+                        else:
+                            c.failed += 1
+                            c.last_error = str(result)
+                            db.set_job_file(job_id, rec.digest, "failed", str(result))
+                        continue
 
-            c.retrying = sum(1 for _, attempt in pending if attempt)
-            refresh(True)
+                    db.mark_uploaded(destination.platform, destination.key, rec, result)
+                    db.set_job_file(job_id, rec.digest, "done")
+                    c.completed += 1
+                    c.bytes_done += rec.size
+
+                # "Retry queued" means files that still need another attempt,
+                # including the unprocessed portion of the current retry round.
+                if attempt:
+                    c.retrying = (len(current_round) - offset) + len(next_round)
+                else:
+                    c.retrying = len(next_round)
+                refresh(True)
+
+                if rate_limit_seconds:
+                    c.retrying = (len(current_round) - offset) + len(next_round)
+                    c.flood_waits += 1
+                    c.last_wait_seconds = rate_limit_seconds
+                    refresh(True)
+                    raise TelegramRateLimitError(rate_limit_seconds)
+
+            current_round = next_round
+
+        c.retrying = 0
+        if c.failed == 0:
+            c.last_error = ""
+        refresh(True)
     finally:
         if live_ctx:
             live_ctx.stop()
@@ -1913,6 +2714,7 @@ def login() -> int:
 
 def doctor() -> int:
     console.print("[bold]Telegram doctor[/]")
+    console.print(f"Version        {package_version()}")
     config = _load_telegram_api_config()
     session_file = Path(str(TELEGRAM_SESSION_BASE) + ".session")
     console.print(f"API configured {'yes' if config else 'no'}")
@@ -2037,6 +2839,23 @@ def resume() -> int:
 def _argv_username(argv: Sequence[str] | None = None) -> str | None:
     args = list(sys.argv[1:] if argv is None else argv)
     return next((arg for arg in args if arg.startswith("@") and len(arg) > 1), None)
+
+
+def _argv_download(argv: Sequence[str] | None = None) -> tuple[str, str | None] | None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "download" not in args:
+        return None
+    marker = args.index("download")
+    rest = args[marker + 1 :]
+    if not rest:
+        return "download", None
+    if rest[0].lower() == "resume":
+        if len(rest) != 1:
+            raise RuntimeError("Use `telegram download resume` without extra arguments.")
+        return "resume", None
+    if len(rest) != 1:
+        raise RuntimeError("Use `telegram download @channel` or `telegram download https://t.me/channel`.")
+    return "download", rest[0]
 
 
 def _argv_native(argv: Sequence[str] | None = None) -> tuple[str, str | None] | None:
@@ -2198,19 +3017,35 @@ def _run_cli(callable_):
 
 
 def telegram_entry():
+    try:
+        download = _argv_download()
+    except RuntimeError as exc:
+        raise SystemExit(_run_cli(lambda exc=exc: (_ for _ in ()).throw(exc)))
+    if download is not None:
+        action, source = download
+        if action == "resume":
+            raise SystemExit(_run_cli(download_resume))
+        raise SystemExit(_run_cli(lambda: download_public_channel(source)))
+
     native = _argv_native()
     if native is not None:
         action, value = native
         raise SystemExit(_run_cli(lambda: native_tdlib(action, value)))
 
     args = list(sys.argv[1:])
+    if args in (["version"], ["--version"], ["-V"]):
+        console.print(package_version())
+        raise SystemExit(0)
     action = _argv_action(args)
     username = _argv_username(args)
     allowed = {"doctor", "login", "resume"}
     unknown = [arg for arg in args if arg not in allowed and not (arg.startswith("@") and len(arg) > 1)]
     if unknown:
         raise SystemExit(_run_cli(lambda: (_ for _ in ()).throw(
-            RuntimeError(f"Unknown command: {unknown[0]}. Use telegram, telegram login, telegram doctor, telegram resume, or telegram @username.")
+            RuntimeError(
+                f"Unknown command: {unknown[0]}. Use telegram, telegram login, telegram doctor, "
+                "telegram resume, telegram download @channel, telegram download resume, or telegram @username."
+            )
         )))
     if action == "doctor":
         raise SystemExit(_run_cli(doctor))
