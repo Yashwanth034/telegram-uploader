@@ -12,11 +12,12 @@ PACKAGE_NAME = "telegram-uploader"
 PUBLIC_NAME = "TG Uploader"
 
 
-def app_data_root() -> Path:
-    home = Path.home()
-    if sys.platform == "win32":
+def app_data_root(platform_name: str | None = None, home: Path | None = None) -> Path:
+    platform_name = sys.platform if platform_name is None else platform_name
+    home = Path.home() if home is None else Path(home)
+    if platform_name == "win32":
         base = Path(os.environ.get("LOCALAPPDATA") or (home / "AppData" / "Local"))
-    elif sys.platform == "darwin":
+    elif platform_name == "darwin":
         base = home / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_DATA_HOME") or (home / ".local" / "share"))
@@ -87,12 +88,18 @@ def _add_windows_user_path(directory: Path) -> bool:
         return False
 
 
-def _add_posix_user_path(directory: Path) -> bool:
-    if os.name == "nt" or str(directory) in os.environ.get("PATH", "").split(os.pathsep):
+def _add_posix_user_path(
+    directory: Path,
+    *,
+    host_os_name: str | None = None,
+    home: Path | None = None,
+) -> bool:
+    host_os_name = os.name if host_os_name is None else host_os_name
+    if host_os_name == "nt" or str(directory) in os.environ.get("PATH", "").split(os.pathsep):
         return False
 
     shell = Path(os.environ.get("SHELL", "")).name
-    home = Path.home()
+    home = Path.home() if home is None else Path(home)
     if shell == "zsh":
         profile = home / ".zshrc"
     elif shell == "bash":

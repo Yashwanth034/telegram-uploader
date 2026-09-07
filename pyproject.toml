@@ -20,7 +20,8 @@ classifiers = [
 ]
 dependencies = [
   "blake3>=1.0.0",
-  "cryptg>=0.6.0,<1",
+  "cryptg>=0.5.2,<0.6; python_version < '3.11'",
+  "cryptg>=0.6.0,<1; python_version >= '3.11'",
   "platformdirs>=4.0.0",
   "rich>=13.7.0",
   "telethon>=1.36.0,<2",
